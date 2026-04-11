@@ -1,0 +1,21 @@
+# OpenRA-RL Challenge dependencies
+
+# Core
+openra-rl>=0.4.0
+openenv-core>=0.2.0
+
+# Training
+torch>=2.0.0
+transformers>=4.40.0
+trl>=0.7.0
+datasets>=2.14.0
+peft>=0.8.0
+accelerate>=0.25.0
+bitsandbytes>=0.41.0
+
+# Data processing
+pandas>=2.0.0
+
+# Notebook support
+jupyter>=1.0.0
+ipywidgets>=8.0.0

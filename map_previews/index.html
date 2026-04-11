@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>OpenRA-RL Map Browser</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #1a1a2e; color: #eee; font-family: 'Segoe UI', sans-serif; padding: 20px; }
+  h1 { text-align: center; margin-bottom: 6px; font-size: 1.6em; color: #e94560; }
+  p.sub { text-align: center; color: #aaa; font-size: 0.85em; margin-bottom: 20px; }
+  input { display: block; margin: 0 auto 20px; width: 360px; padding: 8px 14px;
+          border-radius: 8px; border: 1px solid #444; background: #16213e;
+          color: #eee; font-size: 1em; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; }
+  .card { background: #16213e; border-radius: 10px; overflow: hidden;
+          border: 1px solid #0f3460; transition: transform .15s, box-shadow .15s; cursor: default; }
+  .card:hover { transform: translateY(-3px); box-shadow: 0 6px 20px rgba(233,69,96,.35); }
+  .card img { width: 100%; height: 130px; object-fit: cover; display: block; }
+  .card .name { padding: 8px 10px; font-size: 0.8em; color: #cce; word-break: break-all; }
+  .card .copy { padding: 0 10px 10px; }
+  .card .copy button {
+    background: #e94560; border: none; color: #fff; border-radius: 5px;
+    padding: 4px 10px; font-size: 0.75em; cursor: pointer; width: 100%;
+  }
+  .card .copy button:hover { background: #c73652; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<h1>🗺️ OpenRA-RL Map Browser</h1>
+<p class="sub">66 maps available · click a button to copy the map filename</p>
+<input type="text" id="search" placeholder="Search maps…" oninput="filterMaps()">
+<div class="grid" id="grid"></div>
+
+<script>
+const maps = [
+  "agenda","altercation","a-path-beyond","archipelago","ardennes","ascent",
+  "asymmetric-battle","behind-the-veil","blitz","bombardment-islands",
+  "chaos-canyon","climax-rev15","collaboration","countercross","crossfire",
+  "discovery","doubles","doublestep","doughnut","dual-cold-front","dusttown-battle",
+  "ensio-kaivo","europe","forgotten-plains","fortified","forward-progress",
+  "great-sahara-2","green-belt","hypothermia","imminent-destruction","jungle-law",
+  "keep-off-the-grass-2","mad-science","maelstrom","marigold-town","mass-confliction",
+  "minor-pressure","nine-lives","operation-goldmine","ore-gardens","ore-lord",
+  "outdoor-trails","pie-of-animosity","pitfight","polar-disorder","pool-party",
+  "pressure","progress","ridges","ritual-circle","shadowfiend-II","Siberian-Pass",
+  "sidestep","singles","sudden-death","sunstroke","synergy","tandem","temperal",
+  "tournament-island","trapped","unconventional-warfare","union-sacree","vegetation",
+  "warwind","x-lake","ysmir"
+];
+
+const grid = document.getElementById("grid");
+
+function copyMap(name) {
+  const filename = name + ".oramap";
+  navigator.clipboard.writeText(filename).catch(() => {});
+  event.target.textContent = "Copied!";
+  setTimeout(() => { event.target.textContent = "Copy filename"; }, 1200);
+}
+
+function buildCards() {
+  grid.innerHTML = "";
+  maps.forEach(name => {
+    const card = document.createElement("div");
+    card.className = "card";
+    card.dataset.name = name.toLowerCase();
+    card.innerHTML = `
+      <img src="${name}.png" alt="${name}" onerror="this.style.background='#0f3460';this.removeAttribute('src')">
+      <div class="name">${name}.oramap</div>
+      <div class="copy"><button onclick="copyMap('${name}')">Copy filename</button></div>
+    `;
+    grid.appendChild(card);
+  });
+}
+
+function filterMaps() {
+  const q = document.getElementById("search").value.toLowerCase();
+  document.querySelectorAll(".card").forEach(card => {
+    card.classList.toggle("hidden", !card.dataset.name.includes(q));
+  });
+}
+
+buildCards();
+</script>
+</body>
+</html>
