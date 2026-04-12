@@ -34,9 +34,9 @@ import sys
 import time
 from pathlib import Path
 
-# Add the OpenRA-RL repo to path so we can import the client and scripted bot
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "OpenRA-RL"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "OpenRA-RL" / "examples"))
+# openra_env is installed via: pip install openra-rl
+# scripted_bot.py is vendored in this scripts/ directory
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from openra_env.client import OpenRAEnv
 from openra_env.models import OpenRAAction, OpenRAObservation, CommandModel, ActionType
@@ -44,58 +44,133 @@ from scripted_bot import ScriptedBot
 
 
 class PeriodicAttackBot(ScriptedBot):
-    """ScriptedBot with two fixes:
+    """ScriptedBot with grid-search targeting that works on any map layout.
 
-    Fix 1 — Opposite-corner target:
-        The original bot falls back to map center (64,64) when no enemies are
-        visible. On symmetric 1v1 maps the enemy always starts diagonally
-        opposite to our base, so the army marches to the wrong location and
-        stops. This override attacks toward the mirror of our CY position
-        instead — the actual enemy spawn zone.
-
-    Fix 2 — Periodic re-attack:
-        The original only sends attack-move to *idle* units. Once units reach
-        their destination and stop, is_idle=False so the bot never re-orders
-        them. This override re-issues attack-move to ALL combat units every
-        REATTACK_INTERVAL ticks so the army keeps chasing the enemy.
+    Instead of assuming rotational symmetry, divides the map into a grid
+    and systematically searches cells far from our base for the enemy.
+    Cycles to the next grid cell whenever the army fails to find enemies.
     """
 
-    REATTACK_INTERVAL = 600  # re-issue attack order every ~600 ticks (~18s at 33tps)
+    REATTACK_INTERVAL = 600   # re-issue attack order every ~600 ticks (~18s)
+    CYCLE_AFTER_REATTACKS = 2  # switch target after this many re-attacks with no enemy contact
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._last_attack_tick: int = 0
+        self._candidate_targets: list[tuple[int, int]] = []
+        self._target_index: int = 0
+        self._no_contact_reattacks: int = 0
+        self._cached_map_size: tuple[int, int] | None = None
+        self._enemy_base_pos: tuple[int, int] | None = None
+
+    def _handle_rally_points(self, obs):
+        """Override: set rally on both Allied ('tent') and Soviet ('barr') barracks."""
+        from openra_env.models import CommandModel, ActionType
+        commands = []
+        cy = self._find_building(obs, "fact")
+        if not cy:
+            return commands
+        for b in obs.buildings:
+            if b.type in ("tent", "barr", "weap") and b.actor_id not in self._rally_set:
+                rally_x = cy.cell_x if cy.cell_x > 0 else cy.pos_x // 1024
+                rally_y = cy.cell_y if cy.cell_y > 0 else cy.pos_y // 1024
+                commands.append(CommandModel(
+                    action=ActionType.SET_RALLY_POINT,
+                    actor_id=b.actor_id,
+                    target_x=rally_x,
+                    target_y=rally_y,
+                ))
+                self._rally_set.add(b.actor_id)
+        return commands
+
+    def _get_map_size(self, obs: OpenRAObservation) -> tuple[int, int]:
+        """Return map dimensions, preferring the in-game reported size.
+
+        The reset observation may report padded dimensions (e.g. 128x128)
+        while gameplay observations report the actual playable area (e.g.
+        112x54). Always update the cache when a smaller (more accurate)
+        value is observed.
+        """
+        w, h = obs.map_info.width, obs.map_info.height
+        if w > 0 and h > 0:
+            if self._cached_map_size is None:
+                self._cached_map_size = (w, h)
+            else:
+                cw, ch = self._cached_map_size
+                if w < cw or h < ch:
+                    self._cached_map_size = (w, h)
+                    self._candidate_targets = []
+        if self._cached_map_size is not None:
+            return self._cached_map_size
+        return (128, 128)
+
+    def _compute_candidate_spawns(self, obs: OpenRAObservation) -> list[tuple[int, int]]:
+        """Generate search targets by dividing the map into a grid.
+
+        Produces a 4x4 grid of cell centers, excludes the cell containing
+        our base, and sorts by distance (farthest first) so we check the
+        most likely enemy positions before nearby ones.
+        """
+        cy_bldg = self._find_building(obs, "fact")
+        w, h = self._get_map_size(obs)
+
+        if not cy_bldg:
+            return [(w // 2, h // 2)]
+
+        bx = cy_bldg.cell_x if cy_bldg.cell_x > 0 else cy_bldg.pos_x // 1024
+        by = cy_bldg.cell_y if cy_bldg.cell_y > 0 else cy_bldg.pos_y // 1024
+
+        grid_n = 3
+        cell_w, cell_h = w // grid_n, h // grid_n
+        grid_centers = []
+        for gx in range(grid_n):
+            for gy in range(grid_n):
+                cx = cell_w * gx + cell_w // 2
+                cy = cell_h * gy + cell_h // 2
+                cx = max(0, min(w - 1, cx))
+                cy = max(0, min(h - 1, cy))
+                grid_centers.append((cx, cy))
+
+        min_dist_sq = (min(w, h) // grid_n) ** 2
+        candidates = [
+            p for p in grid_centers
+            if (p[0] - bx) ** 2 + (p[1] - by) ** 2 > min_dist_sq
+        ]
+
+        if not candidates:
+            candidates = [(w // 2, h // 2)]
+
+        candidates.sort(
+            key=lambda p: (p[0] - bx) ** 2 + (p[1] - by) ** 2,
+            reverse=True,
+        )
+        return candidates
 
     def _find_attack_target(self, obs: OpenRAObservation):
-        """Priority: visible enemy buildings > enemy units > opposite corner > map center."""
-        # Priority 1: visible enemy buildings
+        """Priority: visible enemy buildings > enemy units > remembered base > grid search."""
         if obs.visible_enemy_buildings:
             prod_buildings = [
                 b for b in obs.visible_enemy_buildings
                 if b.type in ("fact", "tent", "weap", "hpad", "afld")
             ]
             target = prod_buildings[0] if prod_buildings else obs.visible_enemy_buildings[0]
+            self._enemy_base_pos = (target.cell_x, target.cell_y)
             return target.cell_x, target.cell_y
 
-        # Priority 2: visible enemy units
         if obs.visible_enemies:
             enemy = obs.visible_enemies[0]
+            if self._enemy_base_pos is None:
+                self._enemy_base_pos = (enemy.cell_x, enemy.cell_y)
             return enemy.cell_x, enemy.cell_y
 
-        # Priority 3: mirror our CY across the map (opposite corner = enemy spawn on 1v1 maps)
-        cy = self._find_building(obs, "fact")
-        if cy and obs.map_info.width > 0:
-            w, h = obs.map_info.width, obs.map_info.height
-            # Use cell coords if available, otherwise derive from sub-cell pos
-            cx = cy.cell_x if cy.cell_x > 0 else cy.pos_x // 1024
-            cy_y = cy.cell_y if cy.cell_y > 0 else cy.pos_y // 1024
-            # Clamp to valid map range
-            target_x = max(0, min(w - 1, w - cx - 1))
-            target_y = max(0, min(h - 1, h - cy_y - 1))
-            return target_x, target_y
+        if self._enemy_base_pos is not None:
+            return self._enemy_base_pos
 
-        # Fallback: map center
-        return obs.map_info.width // 2, obs.map_info.height // 2
+        if not self._candidate_targets:
+            self._candidate_targets = self._compute_candidate_spawns(obs)
+            self._target_index = 0
+
+        return self._candidate_targets[self._target_index % len(self._candidate_targets)]
 
     def _handle_combat(self, obs: OpenRAObservation):
         from openra_env.models import CommandModel, ActionType
@@ -103,14 +178,8 @@ class PeriodicAttackBot(ScriptedBot):
         if self.phase != "attack":
             return commands
 
-        # Unload APC near enemy (unchanged)
         commands.extend(self._handle_unload(obs))
 
-        ticks_since_attack = obs.tick - self._last_attack_tick
-        if ticks_since_attack < self.REATTACK_INTERVAL:
-            return commands
-
-        # Send ALL non-guard combat units, not just idle ones
         fighters = [
             u for u in obs.units
             if u.type in self.COMBAT_UNIT_TYPES
@@ -119,6 +188,28 @@ class PeriodicAttackBot(ScriptedBot):
 
         if len(fighters) < 2:
             return commands
+
+        # Reset counter when we actually see enemies (we're at the right place)
+        if obs.visible_enemies or obs.visible_enemy_buildings:
+            self._no_contact_reattacks = 0
+
+        ticks_since_attack = obs.tick - self._last_attack_tick
+        if ticks_since_attack < self.REATTACK_INTERVAL:
+            return commands
+
+        # Each time we re-attack without enemy contact, increment counter.
+        # After CYCLE_AFTER_REATTACKS misses, switch to next candidate.
+        if not obs.visible_enemies and not obs.visible_enemy_buildings:
+            self._no_contact_reattacks += 1
+            if (self._no_contact_reattacks >= self.CYCLE_AFTER_REATTACKS
+                    and self._candidate_targets):
+                self._target_index = (self._target_index + 1) % len(self._candidate_targets)
+                self._no_contact_reattacks = 0
+                self._log(
+                    f"[cycle] No enemy contact after {self.CYCLE_AFTER_REATTACKS} "
+                    f"re-attacks, switching to target #{self._target_index}: "
+                    f"{self._candidate_targets[self._target_index]}"
+                )
 
         target_x, target_y = self._find_attack_target(obs)
         self._last_attack_tick = obs.tick
@@ -185,6 +276,9 @@ async def collect_episode(
         result = await env.reset(map_name=map_name)
         obs = result.observation
 
+        # Let the bot see the reset observation so _get_map_size can initialize
+        # (the correct playable-area dimensions will be refined on later steps)
+
         if verbose:
             print(
                 f"  Episode {episode_id}: Game started on "
@@ -192,6 +286,7 @@ async def collect_episode(
             )
 
         step = 0
+        eliminated_since_step = None
         while not result.done and step < max_steps:
             # Stop if wall-clock time limit exceeded
             elapsed_so_far = time.time() - episode_start
@@ -203,20 +298,37 @@ async def collect_episode(
                     )
                 break
 
+            # Stop early if we've lost everything (0 units + 0 buildings)
+            obs_now = result.observation
+            if not obs_now.units and not obs_now.buildings and step > 100:
+                if eliminated_since_step is None:
+                    eliminated_since_step = step
+                elif step - eliminated_since_step >= 200:
+                    if verbose:
+                        print(
+                            f"  Episode {episode_id}: Eliminated "
+                            f"(0 units/buildings for 200 steps), stopping."
+                        )
+                    break
+            else:
+                eliminated_since_step = None
+
             # Expert decides
-            action = bot.decide(result.observation)
+            obs_before = result.observation
+            action = bot.decide(obs_before)
 
-            # Record the transition
-            trajectory.append({
-                "step": step,
-                "observation": serialize_obs(result.observation),
-                "action": serialize_action(action),
-                "reward": result.reward or 0.0,
-            })
-
-            # Execute
+            # Execute and get reward for THIS action
             result = await env.step(action)
             step += 1
+
+            # Record (s, a, r, done) where r is the reward from taking a in s
+            trajectory.append({
+                "step": step - 1,
+                "observation": serialize_obs(obs_before),
+                "action": serialize_action(action),
+                "reward": result.reward or 0.0,
+                "done": result.done,
+            })
 
             if verbose and step % 200 == 0:
                 eco = result.observation.economy
@@ -231,20 +343,22 @@ async def collect_episode(
                     f"{bot.phase} | {elapsed_min:.1f}min"
                 )
 
-        # Record the final observation
+        # Record the final observation (no action taken, so reward=0)
         final_obs = result.observation
         trajectory.append({
             "step": step,
             "observation": serialize_obs(final_obs),
             "action": {"commands": [{"action": "no_op"}]},
-            "reward": result.reward or 0.0,
-            "terminal": True,
+            "reward": 0.0,
+            "done": True,
         })
 
         if verbose:
             mil = final_obs.military
             if final_obs.done:
                 outcome = final_obs.result
+            elif eliminated_since_step is not None:
+                outcome = "eliminated"
             elif (time.time() - episode_start) >= max_seconds:
                 outcome = f"time_limit({max_minutes:.0f}min)"
             else:
@@ -308,7 +422,7 @@ async def collect_all(
             "episode": i,
             "steps": len(trajectory),
             "ticks": final.get("tick", 0),
-            "result": final.get("result", "timeout"),
+            "result": final.get("result") or "timeout",
             "kills_cost": mil.get("kills_cost", 0),
             "deaths_cost": mil.get("deaths_cost", 0),
             "explored_percent": final.get("explored_percent", 0),

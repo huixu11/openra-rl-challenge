@@ -1,156 +1,67 @@
-# OpenRA-RL Challenge: Teaching LLMs to Play Red Alert 🎮
+# OpenRA-RL Challenge
 
-[![OpenEnv](https://img.shields.io/badge/OpenEnv-Environment-blue)](https://meta-pytorch.org/OpenEnv/)
-[![HuggingFace](https://img.shields.io/badge/🤗-HuggingFace-yellow)](https://huggingface.co/openenv)
-[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-green.svg)](LICENSE)
+Training scripts for **OpenRA-RL** — an environment that lets AI agents play *Command & Conquer: Red Alert*.
 
-**Submission for the [OpenEnv Challenge: SOTA Environments to Drive General Intelligence](https://drive.google.com/file/d/1NASall4R84xAhoDdcaMwwJ78Ao3B-EK4/view)**
+## Why not use the published Docker image?
 
-This repo contains simple training scripts for **OpenRA-RL** — an OpenEnv-compatible environment that lets AI agents play *Command & Conquer: Red Alert* through tool calls.
+The published image (`ghcr.io/yxc20089/openra-rl:latest`) has a critical bug: the AI opponent never spawns, so every game is played against nobody and you get zero combat data. This repo includes two key files that fix this:
 
-## 🏗️ Architecture
+- **`Dockerfile`** — Builds the game server from source, pinned to commit `cbe7c9e859` that includes the AI bot spawn fix. It clones both the OpenRA C# engine and the OpenRA-RL Python server from GitHub automatically — no other repos needed.
+- **`scripts/scripted_bot.py`** — Vendored copy of the base `ScriptedBot` class from `OpenRA-RL/examples/`. This removes the need to have the `OpenRA-RL` repo cloned as a sibling directory. `collect_bot_data.py` imports it directly.
 
-```
-                    ┌─────────────────┐
-                    │   LLM Agent     │  ← Trained via imitation learning
-                    │  (Qwen/LLaMA)   │
-                    └────────┬────────┘
-                             │ JSON tool calls
-                    ┌────────▼────────┐
-                    │  OpenEnv API    │  ← reset() / step() / state()
-                    │  (WebSocket)    │
-                    └────────┬────────┘
-                             │ gRPC
-                    ┌────────▼────────┐
-                    │   OpenRA Game   │  ← Modified C# engine
-                    │  (Red Alert)    │
-                    └─────────────────┘
-```
+See [Bugs Found & Fixed](#bugs-found--fixed) for the full list of 9 bugs fixed.
 
-## 🚀 Quick Start
+## Prerequisites
 
-### 1. Start the OpenRA-RL Environment
+- Docker
+- Python 3.11+
 
-The OpenRA-RL game server runs in Docker. You need to build the image from source first (it's not on Docker Hub).
+## Reproduce
 
-**Option A: Build Docker image from source** (run from the `OpenRA-RL/` repo directory):
 ```bash
-# Clone OpenRA-RL if you haven't already
-cd /path/to/OpenRA-RL
+git clone <this-repo>
+cd openra-rl-challenge
 
-# Build the Docker image (takes ~10 min the first time — compiles the C# game engine)
-docker build -t openra-rl .
+# 1. Build the fixed game server image (~5 min first time, cached after)
+docker build -t openra-rl:local .
 
-# Run the server
-docker run -p 8000:8000 openra-rl
-```
+# 2. Start the server
+docker run -d -p 8000:8000 --name openra-rl-server -e BOT_TYPE=normal openra-rl:local
 
-**Option B: Use the `openra-rl` CLI** (recommended — handles Docker automatically):
-```bash
-# 1. Create and activate a virtual environment
+# 3. Wait ~30 seconds, then verify it's up
+curl http://localhost:8000/health
+
+# 4. Install Python dependencies
 python -m venv .venv
-
-# Windows
+# Windows:
 .venv\Scripts\activate
-
-# macOS / Linux
+# macOS/Linux:
 # source .venv/bin/activate
-
-# 2. Install the openra-rl package
 pip install openra-rl
 
-# 3. Start the game server with a chosen difficulty (default: normal)
-openra-rl server start --difficulty normal
+# 5. Collect data
+python scripts/collect_bot_data.py --episodes 1 --max-minutes 5 --verbose
 ```
 
-The `--difficulty` flag sets the OpenRA built-in AI opponent level:
+On Windows, set `$env:PYTHONUNBUFFERED="1"` before step 5 to see live output.
 
-| Difficulty | Description | Recommended for |
-|------------|-------------|-----------------|
-| `easy` | Passive AI, slow build | Quick sanity tests |
-| `normal` | Balanced AI (**default**) | **Data collection** — best trade-off between pressure and episode length |
-| `hard` | Aggressive rush AI | Advanced data collection once `normal` episodes are collected |
+Output is saved to `data/episodes/`. You should see kills > 0, confirming the AI opponent is active:
 
-To switch difficulty, stop the server and restart it:
-```bash
-openra-rl server stop
-openra-rl server start --difficulty hard
+```
+Episode 1: DONE — TIME_LIMIT(5MIN) | 18585 steps | Kills: 2u/0b | Lost: 12u/5b
 ```
 
-> **Note:** The server takes 30–60 seconds to start up. Wait until you see the health check pass before running scripts. You can check with:
-> ```bash
-> curl http://localhost:8000/health
-> ```
-
-### 2. Collect Expert Data
-
-Run the ScriptedBot (built-in expert) against OpenRA's AI and record the trajectories:
+For a full collection run:
 
 ```bash
-# Default: 10 episodes, 15 minutes each, on singles.oramap (128x128)
-python scripts/collect_bot_data.py --episodes 10 --verbose
-
-# Specify a different map
-python scripts/collect_bot_data.py --episodes 10 --map crossfire.oramap --verbose
-
-# Longer episodes for more combat data
-python scripts/collect_bot_data.py --episodes 10 --max-minutes 20 --verbose
-
-# Quick smoke test
-python scripts/collect_bot_data.py --episodes 2 --max-minutes 2 --verbose
+python scripts/collect_bot_data.py --episodes 10 --max-minutes 15 --verbose
 ```
 
-**Default map:** `singles.oramap` (128×128, standard 1v1). The server ships with 66 maps.
+Each 15-minute episode produces ~20,000 steps. 10 episodes takes ~2.5 hours.
 
-**List all available maps:**
-```bash
-docker exec openra-rl-server find /opt/openra/mods/ra/maps -name "*.oramap"
-```
-
-**Extract map preview images** (each `.oramap` is a ZIP containing `map.png`):
-
-```powershell
-# Windows PowerShell — extracts all 66 previews into map_previews/
-$maps = docker exec openra-rl-server find /opt/openra/mods/ra/maps -name "*.oramap" |
-        ForEach-Object { $_.Trim() }
-New-Item -ItemType Directory -Force -Path map_previews | Out-Null
-foreach ($mapPath in $maps) {
-    $name = [System.IO.Path]::GetFileNameWithoutExtension($mapPath)
-    docker cp "openra-rl-server:${mapPath}" "map_previews\${name}.zip"
-    Expand-Archive -Path "map_previews\${name}.zip" -DestinationPath "map_previews\${name}_tmp" -Force
-    Copy-Item "map_previews\${name}_tmp\map.png" "map_previews\${name}.png" -ErrorAction SilentlyContinue
-    Remove-Item "map_previews\${name}.zip", "map_previews\${name}_tmp" -Recurse -Force -ErrorAction SilentlyContinue
-}
-```
+### Train (optional)
 
 ```bash
-# macOS / Linux — extracts all 66 previews into map_previews/
-mkdir -p map_previews
-docker exec openra-rl-server find /opt/openra/mods/ra/maps -name "*.oramap" | while read map; do
-    name=$(basename "$map" .oramap)
-    docker cp "openra-rl-server:$map" /tmp/${name}.zip
-    unzip -p /tmp/${name}.zip map.png > map_previews/${name}.png 2>/dev/null
-    rm /tmp/${name}.zip
-done
-```
-
-Then open `map_previews/index.html` in a browser for an interactive preview grid with search.
-
-> **Timing:** The server runs at ~23 steps/second, so each 15-minute episode ≈ 20,000 steps ≈ 35–40 MB of JSON. 10 episodes takes ~2.5 hours total.
->
-> **Why 15 minutes?** The ScriptedBot builds a base for the first ~10 minutes, then attacks. You need 10+ minutes to capture actual combat data. Episodes end early if the game finishes (win/lose) before the time limit.
-
-This saves trajectories to `data/episodes/` — each file is a list of `{step, observation, action, reward}` dicts, one per game step.
-
-### 3. Train via Imitation Learning
-
-Fine-tune a small LLM on the collected demonstrations using behavioral cloning:
-
-```bash
-# Inspect the data first (no GPU needed):
-python scripts/train_imitation.py --data-dir data/episodes --prepare-only
-
-# Train:
 python scripts/train_imitation.py \
     --data-dir data/episodes \
     --model Qwen/Qwen3-4B \
@@ -158,61 +69,44 @@ python scripts/train_imitation.py \
     --output-dir checkpoints/openra-il
 ```
 
-### 4. Evaluate
-
-Score episodes using the shaped reward function:
-
-```python
-from rewards.shaped_reward import EvalReward
-import json
-
-reward_fn = EvalReward()
-
-with open("data/episodes/episode_001.json") as f:
-    trajectory = json.load(f)
-
-scores = reward_fn.score_trajectory(trajectory)
-print(scores)
-# {'components': {'exploration': 0.45, 'base_progress': 0.8, ...}, 'total': 0.52}
-```
-
-## 📁 Repo Structure
+## Repo Structure
 
 ```
 openra-rl-challenge/
+├── Dockerfile                  # Builds the fixed game server image
 ├── scripts/
-│   ├── collect_bot_data.py     # Bot-vs-bot data collection
-│   └── train_imitation.py      # Behavioral cloning with TRL SFTTrainer
+│   ├── collect_bot_data.py     # Data collection (bug fixes applied)
+│   ├── scripted_bot.py         # Base ScriptedBot (vendored from OpenRA-RL)
+│   └── train_imitation.py      # Behavioral cloning trainer
 ├── rewards/
-│   └── shaped_reward.py        # Evaluation reward (exploration + progress + combat)
-├── notebooks/
-│   └── openra_rl_demo.ipynb    # End-to-end demo notebook
+│   └── shaped_reward.py        # Evaluation reward function
 ├── requirements.txt
 └── README.md
 ```
 
-## 🎯 Reward Design
+## Bugs Found & Fixed
 
-The evaluation reward scores episodes across 6 dimensions:
+The published Docker image (`ghcr.io/yxc20089/openra-rl:latest`) has bugs that prevent data collection. The `Dockerfile` and `collect_bot_data.py` in this repo contain all fixes. Using `docker build` from this repo is required.
 
-| Component | Weight | What it measures |
-|-----------|--------|-----------------|
-| **Exploration** | 0.20 | Fraction of map explored (fog of war cleared) |
-| **Base Progress** | 0.20 | Buildings constructed & building type diversity |
-| **Army Strength** | 0.15 | Number of units trained |
-| **Combat Ratio** | 0.20 | Kill/death cost ratio |
-| **Survival** | 0.10 | How long the agent survived |
-| **Outcome** | 0.15 | Win (+1.0) / Lose (-0.3) |
+### Docker image bugs (fixed by the Dockerfile)
 
-> **Note**: This reward is used for **evaluation only**, not training. The imitation learning agent is trained purely on behavioral cloning from the ScriptedBot expert.
+| # | Bug | Root Cause | Fix |
+|---|-----|-----------|-----|
+| 1 | **AI opponent never spawns** (critical) | `OpenRA.Game.dll` is built from an old commit missing `spectate` and `slot_bot` lobby commands in `LoadMap`. The AI player slot is silently dropped. | Dockerfile pins OpenRA to commit `cbe7c9e859` which includes fix `8c96a76b4c`. |
+| 2 | **Invalid bot type** | `BOT_TYPE=hard` is passed directly to OpenRA, which only accepts `rush`/`normal`/`turtle`/`naval`. Unrecognized types are silently ignored. | Rebuilt image includes `BOT_TYPE_MAP` that translates `hard` -> `normal`. |
 
-## 🔗 Links
+### Script bugs (fixed in `collect_bot_data.py`)
 
-- **Environment**: [OpenRA-RL on HuggingFace](https://huggingface.co/openenv)
-- **OpenRA-RL Repo**: [GitHub](https://github.com/your-org/OpenRA-RL)
-- **OpenEnv Framework**: [meta-pytorch/OpenEnv](https://github.com/meta-pytorch/OpenEnv)
-- **Blog Post**: [HuggingFace Blog](https://huggingface.co/blog)
+| # | Bug | Fix |
+|---|-----|-----|
+| 3 | **Reward off-by-one** — each entry's reward came from the previous action | Reordered loop: capture obs/action, call `step()`, then record reward |
+| 4 | **Soviet barracks (`barr`) missing from rally points** — infantry don't rally | Override `_handle_rally_points` to include `barr` |
+| 5 | **Terminal entry duplicated last reward** | Set terminal entry reward to `0.0` |
+| 6 | **Summary shows empty string instead of "timeout"** | Changed `get("result", "timeout")` to `get("result") or "timeout"` |
+| 7 | **Missing `done` flag in trajectory entries** | Added `"done": result.done` to every entry |
+| 8 | **Map dimensions wrong (128x128 vs 112x54)** — targets outside playable area | `_get_map_size` now updates cache when smaller dimensions are observed |
+| 9 | **Bot leaves enemy base after first contact** | Added `_enemy_base_pos` to remember and re-attack the discovered location |
 
-## 📄 License
+## License
 
-GPL-3.0 — same as OpenRA.
+GPL-3.0
