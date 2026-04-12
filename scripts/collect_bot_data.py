@@ -251,6 +251,27 @@ def serialize_action(action: OpenRAAction) -> dict:
     return action.model_dump()
 
 
+def available_credits(obs: OpenRAObservation) -> int:
+    """OpenRA spendable money = liquid cash + stored ore/resources."""
+    return obs.economy.cash + obs.economy.ore
+
+
+def infer_outcome(
+    final_obs: OpenRAObservation,
+    eliminated_since_step: int | None,
+    elapsed_s: float,
+    max_minutes: float,
+) -> str:
+    """Classify why an episode stopped when the env did not emit a final result."""
+    if final_obs.done and final_obs.result:
+        return final_obs.result
+    if eliminated_since_step is not None or (not final_obs.units and not final_obs.buildings):
+        return "eliminated"
+    if elapsed_s >= max_minutes * 60.0:
+        return f"time_limit({max_minutes:.0f}min)"
+    return "step_limit"
+
+
 async def collect_episode(
     env_url: str,
     episode_id: int,
@@ -344,10 +365,11 @@ async def collect_episode(
                 n_units = len(result.observation.units)
                 n_buildings = len(result.observation.buildings)
                 elapsed_min = (time.time() - episode_start) / 60.0
+                credits = available_credits(result.observation)
                 print(
                     f"  Episode {episode_id}: Step {step:4d} | "
                     f"Tick {result.observation.tick:5d} | "
-                    f"${eco.cash:5d} | "
+                    f"Cash:${eco.cash:5d} Ore:{eco.ore:5d} Tot:${credits:5d} | "
                     f"Units:{n_units} Bldgs:{n_buildings} | "
                     f"{bot.phase} | {elapsed_min:.1f}min"
                 )
@@ -364,15 +386,9 @@ async def collect_episode(
 
         if verbose:
             mil = final_obs.military
-            if final_obs.done:
-                outcome = final_obs.result
-            elif eliminated_since_step is not None:
-                outcome = "eliminated"
-            elif (time.time() - episode_start) >= max_seconds:
-                outcome = f"time_limit({max_minutes:.0f}min)"
-            else:
-                outcome = "step_limit"
-            elapsed_total = (time.time() - episode_start) / 60.0
+            elapsed_total_s = time.time() - episode_start
+            outcome = infer_outcome(final_obs, eliminated_since_step, elapsed_total_s, max_minutes)
+            elapsed_total = elapsed_total_s / 60.0
             print(
                 f"  Episode {episode_id}: DONE — {outcome.upper()} | "
                 f"{step} steps | Tick {final_obs.tick} | "
@@ -429,16 +445,26 @@ async def collect_all(
         # Compute summary
         final = trajectory[-1]["observation"]
         mil = final.get("military", {})
+        final_units = len(final.get("units", []))
+        final_buildings = len(final.get("buildings", []))
+        summary_result = final.get("result")
+        if not summary_result:
+            if final_units == 0 and final_buildings == 0:
+                summary_result = "eliminated"
+            elif elapsed >= max_minutes * 60.0:
+                summary_result = f"time_limit({max_minutes:.0f}min)"
+            else:
+                summary_result = "step_limit"
         summary = {
             "episode": i,
             "steps": len(trajectory),
             "ticks": final.get("tick", 0),
-            "result": final.get("result") or "timeout",
+            "result": summary_result,
             "kills_cost": mil.get("kills_cost", 0),
             "deaths_cost": mil.get("deaths_cost", 0),
             "explored_percent": final.get("explored_percent", 0),
-            "final_buildings": len(final.get("buildings", [])),
-            "final_units": len(final.get("units", [])),
+            "final_buildings": final_buildings,
+            "final_units": final_units,
             "elapsed_s": round(elapsed, 1),
             "file": str(filename),
         }
