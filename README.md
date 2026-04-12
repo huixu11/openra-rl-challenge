@@ -59,6 +59,16 @@ python scripts/collect_bot_data.py --episodes 10 --max-minutes 15 --verbose
 
 Each 15-minute episode produces ~20,000 steps. 10 episodes takes ~2.5 hours.
 
+### Normal AI vs Normal AI
+
+To collect data where the Python bot mimics OpenRA's built-in normal AI logic:
+
+```bash
+python scripts/collect_bot_data.py --episodes 10 --max-minutes 15 --bot normal --verbose
+```
+
+This uses `NormalAIBot` — a Python reimplementation of OpenRA's `ModularBot@NormalAI` with weighted unit production, dynamic base building, squad management, and economy logic ported from `ai.yaml`.
+
 ### Train (optional)
 
 ```bash
@@ -75,8 +85,9 @@ python scripts/train_imitation.py \
 openra-rl-challenge/
 ├── Dockerfile                  # Builds the fixed game server image
 ├── scripts/
-│   ├── collect_bot_data.py     # Data collection (bug fixes applied)
+│   ├── collect_bot_data.py     # Data collection (--bot scripted|normal)
 │   ├── scripted_bot.py         # Base ScriptedBot (vendored from OpenRA-RL)
+│   ├── normal_ai_bot.py        # NormalAIBot — Python port of OpenRA's normal AI
 │   └── train_imitation.py      # Behavioral cloning trainer
 ├── rewards/
 │   └── shaped_reward.py        # Evaluation reward function

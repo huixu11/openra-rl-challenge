@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""Collect expert demonstrations by running the ScriptedBot against OpenRA's built-in AI.
+"""Collect expert demonstrations by running a bot against OpenRA's built-in AI.
+
+Supports two Python bots:
+  - scripted: PeriodicAttackBot (simple build-order + periodic grid-search attack)
+  - normal:   NormalAIBot (reimplements OpenRA's ModularBot@NormalAI in Python)
 
 Usage:
     # Start the OpenRA-RL server first:
     docker run -p 8000:8000 openra-rl
 
-    # Collect 10 episodes, each up to 15 minutes (default):
+    # Collect with the default scripted bot:
     python scripts/collect_bot_data.py --episodes 10
 
-    # Use explicit time limit:
-    python scripts/collect_bot_data.py --episodes 10 --max-minutes 20
+    # Collect with the normal AI bot (mimics OpenRA's built-in normal AI):
+    python scripts/collect_bot_data.py --episodes 10 --bot normal
 
     # Quick test (2 minutes per episode):
-    python scripts/collect_bot_data.py --episodes 2 --max-minutes 2
+    python scripts/collect_bot_data.py --episodes 2 --max-minutes 2 --bot normal
 
 Output:
     data/episodes/episode_001.json  — list of {observation, action, reward} dicts
@@ -41,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from openra_env.client import OpenRAEnv
 from openra_env.models import OpenRAAction, OpenRAObservation, CommandModel, ActionType
 from scripted_bot import ScriptedBot
+from normal_ai_bot import NormalAIBot
 
 
 class PeriodicAttackBot(ScriptedBot):
@@ -253,8 +258,9 @@ async def collect_episode(
     max_minutes: float = 15.0,
     map_name: str = "singles.oramap",
     verbose: bool = False,
+    bot_type: str = "scripted",
 ) -> list[dict]:
-    """Play one full game with the ScriptedBot and record the trajectory.
+    """Play one full game and record the trajectory.
 
     Stops when any of these conditions is met (in order):
       1. Game ends (win / lose)
@@ -264,7 +270,10 @@ async def collect_episode(
     Returns:
         List of {observation, action, reward} dicts — one per game step.
     """
-    bot = PeriodicAttackBot(verbose=False)
+    if bot_type == "normal":
+        bot = NormalAIBot(verbose=verbose)
+    else:
+        bot = PeriodicAttackBot(verbose=False)
     trajectory = []
     max_seconds = max_minutes * 60.0
     episode_start = time.time()
@@ -383,6 +392,7 @@ async def collect_all(
     map_name: str,
     output_dir: Path,
     verbose: bool,
+    bot_type: str = "scripted",
 ):
     """Collect multiple episodes sequentially."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -403,6 +413,7 @@ async def collect_all(
                 max_minutes=max_minutes,
                 map_name=map_name,
                 verbose=verbose,
+                bot_type=bot_type,
             )
         except Exception as e:
             print(f"  Episode {i} FAILED: {e}")
@@ -506,6 +517,15 @@ def main():
         help="Output directory for trajectory files (default: data/episodes)",
     )
     parser.add_argument(
+        "--bot",
+        choices=["scripted", "normal"],
+        default="scripted",
+        help=(
+            "Which Python bot to use (default: scripted). "
+            "'normal' uses NormalAIBot that mimics OpenRA's built-in normal AI."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print per-step progress",
@@ -522,6 +542,7 @@ def main():
                 map_name=args.map,
                 output_dir=args.output_dir,
                 verbose=args.verbose,
+                bot_type=args.bot,
             )
         )
     except KeyboardInterrupt:
