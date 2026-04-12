@@ -286,6 +286,86 @@ Interpretation:
   preservation, defense/build spending while the frontline collapses, and still
   imperfect force commitment
 
+### Post-Contact Stabilization Pass Applied
+
+The next follow-up pass targeted the specific collapse pattern that remained
+after the first combat pass:
+
+- the bot could win or trade the first clash partially
+- then it would keep spending into the wrong things while its army count fell
+- and finally it would collapse at home instead of rebuilding a stable force
+
+The stabilization changes added in `scripts/normal_ai_bot.py` were:
+
+- track recent combat contact and enter a temporary recovery mode after large
+  post-fight army drops
+- pause MCV expansion while recovering
+- reduce harvester targets while recovering so frontline rebuild is not starved
+- suppress most non-essential dynamic building during recovery
+- keep a small home-guard reserve for remote attacks instead of emptying the
+  entire base every time
+- trigger recovery immediately when a local fight decides to retreat
+- cap emergency recovery-defense spending so the bot does not endlessly stack
+  new turrets while the army is still weak
+
+Validation result:
+
+```bash
+python scripts/collect_bot_data.py --episodes 1 --max-minutes 3 --bot normal --verbose --output-dir data/episodes_smoketest_stabilize2
+```
+
+- recovery mode now visibly triggers in logs after post-fight drops
+- the bot no longer immediately falls into the earlier harvester-plus-tech
+  collapse pattern
+- the validated run survived much longer and reached:
+  - `time`: about `2.9` minutes before elimination
+  - `kills`: `112u / 8b`
+  - `losses`: `119u / 15b`
+- this is still not "beats `EasyAI` reliably", but it is a material
+  stabilization improvement over the earlier collapse-heavy behavior
+
+One later smoke test hit a server-side execution error near the end of the run,
+so the reliable validation reference for this pass should remain the
+`episodes_smoketest_stabilize2` run above rather than the later failed run.
+
+### Economy Preservation Pass Applied
+
+Because long games were still collapsing after partial battlefield recovery, the
+next pass focused on following OpenRA's economy priorities more closely where
+the bridge allows it:
+
+- add visible-threat harvester retreat toward refineries/base as a coarse
+  approximation of the real harvester `Dock`/avoidance behavior
+- slow recovery-mode clearing so the bot does not flip back to aggression too
+  early after one partial rebuild
+- allow refinery rebuild during recovery when the base is stable and credits are
+  available
+- keep recovery-time harvester targets conservative so combat rebuild remains
+  funded
+
+Reference source for this direction:
+
+- `../openra-rl/openra/OpenRA.Mods.Common/Traits/BotModules/HarvesterBotModule.cs`
+- `../openra-rl/openra/OpenRA.Mods.Common/Traits/BotModules/UnitBuilderBotModule.cs`
+
+Validation:
+
+```bash
+python scripts/collect_bot_data.py --episodes 1 --max-minutes 3 --bot normal --verbose --output-dir data/episodes_smoketest_tune_econ2
+```
+
+Observed result:
+
+- the bot still shows significant run-to-run variance
+- however, the OpenRA-aligned economy/recovery pass remained directionally
+  useful in the validated reference run:
+  - survived to about `2.6` minutes
+  - `89u / 8b` kills
+  - no early harvester-spam collapse after first contact
+- a separate run (`episodes_smoketest_tune_econ1`) performed materially worse,
+  so this pass should be treated as a useful but still noisy tuning step, not a
+  solved economy problem
+
 ## Remaining Gaps Vs Real OpenRA Bot
 
 The Python bot is still only a partial port. The largest missing pieces are:
@@ -316,11 +396,13 @@ The Python bot is still only a partial port. The largest missing pieces are:
    - local target prioritization
    - limited regroup behavior
    - basic local strength checks / attack-or-flee gating
+   - post-contact recovery mode
+   - remote-attack home-guard reserve
 
    What is still missing:
-   - more reliable post-fight retreat / re-engage behavior
+   - more reliable post-fight retreat / re-engage timing
    - separate assault/protection/rush squad handling
-   - better preservation of the home base while an assault is out on the map
+   - stronger preservation of the home base while an assault is out on the map
 
 5. MCV expansion is only a coarse approximation.
    It can now request and deploy extra MCVs, but it still lacks the real

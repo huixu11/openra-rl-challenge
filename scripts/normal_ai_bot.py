@@ -173,6 +173,19 @@ MCV_TARGET_REACHED_RADIUS = 2
 MCV_TRY_MAINTAIN_RANGE = 8
 MCV_FRIENDLY_CONYARD_DISLIKE_RANGE = 14
 MCV_FRIENDLY_REFINERY_DISLIKE_RANGE = 14
+HARVESTER_THREAT_RADIUS = 10
+HARVESTER_RETREAT_COOLDOWN = 120
+POST_CONTACT_WINDOW = 2400
+RECOVERY_DURATION = 2600
+RECOVERY_TRIGGER_PEAK = 24
+RECOVERY_DROP_RATIO = 0.6
+RECOVERY_MIN_COMBAT = 16
+RECOVERY_EXIT_COMBAT = 24
+RECOVERY_HARVESTER_CAP = 2
+RECOVERY_CLEAR_CONTACT_GAP = 450
+RECOVERY_REFINERY_REBUILD_CREDITS = 2000
+HOME_GUARD_MIN_RESERVE = 6
+HOME_GUARD_MAX_RESERVE = 10
 
 
 class NormalAIBot:
@@ -214,6 +227,10 @@ class NormalAIBot:
         self._last_mcv_scan_tick = -9999
         self._last_mcv_build_tick = -9999
         self._mcv_targets: dict[int, tuple[int, int]] = {}
+        self._harvester_retreat_until: dict[int, int] = {}
+        self._combat_peak = 0
+        self._last_contact_tick = -9999
+        self._recovery_until_tick = -9999
 
         # Map
         self._cached_map_size: Optional[Tuple[int, int]] = None
@@ -225,6 +242,7 @@ class NormalAIBot:
         self._update_map_size(obs)
         self._update_phase(obs)
         self._cleanup_dead(obs)
+        self._update_post_contact_state(obs)
 
         commands.extend(self._handle_placement(obs))
 
@@ -380,7 +398,7 @@ class NormalAIBot:
             return commands
 
         # Phase 2: dynamic base building driven by the normal AI priorities.
-        item = self._choose_dynamic_building(obs)
+        item = self._choose_recovery_building(obs) if self._in_recovery_mode(obs) else self._choose_dynamic_building(obs)
         if item and self._can_produce(obs, item):
             cost = BUILDING_COSTS.get(item, 500)
             if credits >= cost:
@@ -449,6 +467,49 @@ class NormalAIBot:
             if count * 100 > BUILDING_FRACTIONS[item] * total_buildings:
                 continue
             return item
+
+        return None
+
+    def _choose_recovery_building(self, obs: OpenRAObservation) -> Optional[str]:
+        bldg_counts = self._building_counts(obs)
+        credits = self._available_credits(obs)
+        power_balance = obs.economy.power_provided - obs.economy.power_drained
+        minimum_excess_power = self._minimum_excess_power_target(obs)
+        power_item = self._best_power_building(obs)
+
+        if power_balance < minimum_excess_power and power_item:
+            return power_item
+
+        refinery_count = bldg_counts.get("proc", 0)
+        if (
+            refinery_count == 0
+            and not self._base_under_pressure(obs)
+            and credits >= RECOVERY_REFINERY_REBUILD_CREDITS
+            and self._can_produce(obs, "proc")
+        ):
+            return "proc"
+
+        if not any(b.type in WAR_FACTORY_TYPES for b in obs.buildings):
+            if self._can_produce(obs, "weap"):
+                return "weap"
+
+        if not any(b.type in BARRACKS_TYPES for b in obs.buildings):
+            barracks = self._resolve_build_item(obs, "barracks")
+            if barracks and self._can_produce(obs, barracks):
+                return barracks
+
+        if self._base_under_pressure(obs):
+            defense_count = sum(bldg_counts.get(item, 0) for item in ("ftur", "gun", "pbox"))
+            defense_cap = 1 if self._combat_unit_count(obs) < RECOVERY_EXIT_COMBAT else 2
+            if defense_count >= defense_cap:
+                return power_item if power_balance < 0 and power_item else None
+            for item in ("ftur", "gun", "pbox"):
+                if not self._can_produce(obs, item):
+                    continue
+                limit = BUILDING_LIMITS.get(item)
+                if limit is not None and bldg_counts.get(item, 0) >= limit:
+                    continue
+                return item
 
         return None
 
@@ -531,7 +592,25 @@ class NormalAIBot:
 
         self._last_harvester_scan_tick = obs.tick
         for u in obs.units:
-            if u.type == "harv" and u.is_idle:
+            if u.type != "harv":
+                continue
+
+            threat = self._nearest_enemy_to_unit(obs, u, HARVESTER_THREAT_RADIUS)
+            if threat is not None:
+                self._last_contact_tick = obs.tick
+                if obs.tick >= self._harvester_retreat_until.get(u.actor_id, -9999):
+                    fallback = self._pick_harvester_retreat_point(obs, u)
+                    if fallback is not None:
+                        commands.append(CommandModel(
+                            action=ActionType.MOVE,
+                            actor_id=u.actor_id,
+                            target_x=fallback[0],
+                            target_y=fallback[1],
+                        ))
+                        self._harvester_retreat_until[u.actor_id] = obs.tick + HARVESTER_RETREAT_COOLDOWN
+                continue
+
+            if u.is_idle:
                 commands.append(CommandModel(action=ActionType.HARVEST, actor_id=u.actor_id))
 
         self._ensure_harvester_requests(obs)
@@ -541,7 +620,7 @@ class NormalAIBot:
 
     def _manage_expansion(self, obs: OpenRAObservation) -> List[CommandModel]:
         commands = []
-        if self.phase == "deploy_mcv":
+        if self.phase == "deploy_mcv" or self._in_recovery_mode(obs):
             return commands
 
         if obs.tick - self._last_mcv_build_tick >= BUILD_MCV_INTERVAL:
@@ -602,6 +681,16 @@ class NormalAIBot:
         idx = 0
         while idx < len(self._unit_requests):
             item_type = self._unit_requests[idx]
+            if item_type == "harv":
+                current = self._current_unit_count(obs, "harv")
+                pending = sum(1 for p in obs.production if p.item == "harv")
+                queued = self._requested_production_count("harv")
+                if current + pending + queued - 1 >= self._harvester_target(obs):
+                    del self._unit_requests[idx]
+                    continue
+                if self._should_delay_harvester_request(obs, current):
+                    idx += 1
+                    continue
             queue_type = self._queue_type_for_unit(item_type)
             if queue_type is None:
                 del self._unit_requests[idx]
@@ -654,25 +743,12 @@ class NormalAIBot:
         if not obs.visible_enemies or obs.tick - self._last_protection_tick < PROTECTION_RESPONSE_COOLDOWN:
             return commands
 
-        protected_points: list[tuple[int, int, int]] = []
-        for b in obs.buildings:
-            if b.type in PROTECTION_TYPES:
-                bx = b.cell_x if b.cell_x > 0 else b.pos_x // 1024
-                by = b.cell_y if b.cell_y > 0 else b.pos_y // 1024
-                protected_points.append((bx, by, PROTECTION_SCAN_RADIUS))
-        for u in obs.units:
-            if u.type in {"harv", "mcv"}:
-                protected_points.append((u.cell_x, u.cell_y, PROTECT_UNIT_SCAN_RADIUS))
-
-        threat = None
-        for e in obs.visible_enemies:
-            if any(abs(e.cell_x - px) + abs(e.cell_y - py) <= radius for px, py, radius in protected_points):
-                threat = e
-                break
+        threat = next(iter(self._base_threat_enemies(obs)), None)
         if not threat:
             return commands
 
         self._last_protection_tick = obs.tick
+        self._last_contact_tick = obs.tick
         alive = {u.actor_id: u for u in obs.units}
         for uid in self._attack_squad:
             u = alive.get(uid)
@@ -703,9 +779,11 @@ class NormalAIBot:
         )
 
         if local_enemy_units or local_enemy_buildings:
+            self._last_contact_tick = obs.tick
             if not self._should_take_local_fight(squad_units, local_enemy_units, local_enemy_buildings, rush=full_redirect):
                 retreat_commands = self._retreat_squad_commands(obs, squad_units, leader)
                 if retreat_commands:
+                    self._recovery_until_tick = max(self._recovery_until_tick, obs.tick + RECOVERY_DURATION)
                     self._last_rush_tick = obs.tick
                     self._log(
                         f"Retreating {len(retreat_commands)} units "
@@ -724,6 +802,9 @@ class NormalAIBot:
                     )
                     return focus_commands
 
+        if self._in_recovery_mode(obs):
+            return commands
+
         if len(squad_units) < self._assault_threshold:
             return commands
 
@@ -733,7 +814,8 @@ class NormalAIBot:
 
         tx, ty = self._find_attack_target(obs)
         redirected = 0
-        for u in squad_units:
+        attackers = self._attack_wave_units(obs, squad_units)
+        for u in attackers:
             if full_redirect or u.is_idle:
                 commands.append(CommandModel(
                     action=ActionType.ATTACK_MOVE, actor_id=u.actor_id,
@@ -743,7 +825,7 @@ class NormalAIBot:
         if redirected:
             if full_redirect:
                 self._last_rush_tick = obs.tick
-            self._log(f"Attack-move {redirected}/{len(squad_units)} units -> ({tx},{ty})")
+            self._log(f"Attack-move {redirected}/{len(attackers)} committed -> ({tx},{ty})")
         return commands
 
     def _find_attack_target(self, obs: OpenRAObservation) -> Tuple[int, int]:
@@ -863,6 +945,41 @@ class NormalAIBot:
             for actor_id, expected_change in self._powered_down.items()
             if actor_id in alive_b
         }
+        self._harvester_retreat_until = {
+            actor_id: tick
+            for actor_id, tick in self._harvester_retreat_until.items()
+            if actor_id in alive
+        }
+
+    def _update_post_contact_state(self, obs: OpenRAObservation):
+        combat_count = self._combat_unit_count(obs)
+        was_recovering = self._in_recovery_mode(obs)
+        self._combat_peak = max(self._combat_peak, combat_count)
+
+        if self._base_under_pressure(obs):
+            self._last_contact_tick = obs.tick
+
+        had_recent_contact = obs.tick - self._last_contact_tick <= POST_CONTACT_WINDOW
+        collapse_threshold = max(RECOVERY_MIN_COMBAT, int(self._combat_peak * RECOVERY_DROP_RATIO))
+        if had_recent_contact and self._combat_peak >= RECOVERY_TRIGGER_PEAK and combat_count <= collapse_threshold:
+            self._recovery_until_tick = max(self._recovery_until_tick, obs.tick + RECOVERY_DURATION)
+
+        if (
+            was_recovering
+            and combat_count >= max(RECOVERY_EXIT_COMBAT, int(self._combat_peak * 0.75))
+            and obs.tick - self._last_contact_tick >= RECOVERY_CLEAR_CONTACT_GAP
+            and not self._base_under_pressure(obs)
+        ):
+            self._recovery_until_tick = obs.tick
+            self._combat_peak = combat_count
+        elif not had_recent_contact and combat_count < RECOVERY_TRIGGER_PEAK:
+            self._combat_peak = max(combat_count, self._combat_peak - 1)
+
+        is_recovering = self._in_recovery_mode(obs)
+        if not was_recovering and is_recovering:
+            self._log(f"Recovery mode -> rebuild ({combat_count} combat units, peak {self._combat_peak})")
+        elif was_recovering and not is_recovering:
+            self._log(f"Recovery mode -> cleared ({combat_count} combat units)")
 
     # ── Map ───────────────────────────────────────────────────────
 
@@ -891,6 +1008,84 @@ class NormalAIBot:
     def _available_credits(self, obs: OpenRAObservation) -> int:
         # OpenRA splits spendable funds between liquid cash and stored ore/resources.
         return obs.economy.cash + obs.economy.ore
+
+    def _combat_unit_count(self, obs: OpenRAObservation) -> int:
+        return sum(1 for u in obs.units if u.type in COMBAT_TYPES)
+
+    def _in_recovery_mode(self, obs: OpenRAObservation) -> bool:
+        return obs.tick < self._recovery_until_tick
+
+    def _base_center(self, obs: OpenRAObservation) -> Optional[Tuple[int, int]]:
+        cy = self._find_building(obs, "fact")
+        if cy is not None:
+            return (
+                cy.cell_x if cy.cell_x > 0 else cy.pos_x // 1024,
+                cy.cell_y if cy.cell_y > 0 else cy.pos_y // 1024,
+            )
+        if obs.buildings:
+            b = obs.buildings[0]
+            return (
+                b.cell_x if b.cell_x > 0 else b.pos_x // 1024,
+                b.cell_y if b.cell_y > 0 else b.pos_y // 1024,
+            )
+        return None
+
+    def _protected_points(self, obs: OpenRAObservation) -> list[tuple[int, int, int]]:
+        protected_points: list[tuple[int, int, int]] = []
+        for b in obs.buildings:
+            if b.type in PROTECTION_TYPES:
+                bx = b.cell_x if b.cell_x > 0 else b.pos_x // 1024
+                by = b.cell_y if b.cell_y > 0 else b.pos_y // 1024
+                protected_points.append((bx, by, PROTECTION_SCAN_RADIUS))
+        for u in obs.units:
+            if u.type in {"harv", "mcv"}:
+                protected_points.append((u.cell_x, u.cell_y, PROTECT_UNIT_SCAN_RADIUS))
+        return protected_points
+
+    def _base_threat_enemies(self, obs: OpenRAObservation) -> list[UnitInfoModel]:
+        protected_points = self._protected_points(obs)
+        if not protected_points:
+            return []
+        return [
+            e for e in obs.visible_enemies
+            if any(self._cell_distance(e.cell_x, e.cell_y, px, py) <= radius for px, py, radius in protected_points)
+        ]
+
+    def _base_under_pressure(self, obs: OpenRAObservation) -> bool:
+        return bool(self._base_threat_enemies(obs))
+
+    def _nearest_enemy_to_unit(
+        self,
+        obs: OpenRAObservation,
+        unit: UnitInfoModel,
+        radius: int,
+    ) -> Optional[UnitInfoModel]:
+        nearby = self._visible_enemy_units_near(obs, unit.cell_x, unit.cell_y, radius)
+        if not nearby:
+            return None
+        return min(nearby, key=lambda e: self._cell_distance(unit.cell_x, unit.cell_y, e.cell_x, e.cell_y))
+
+    def _pick_harvester_retreat_point(
+        self,
+        obs: OpenRAObservation,
+        harvester: UnitInfoModel,
+    ) -> Optional[Tuple[int, int]]:
+        refineries = [b for b in obs.buildings if b.type == "proc"]
+        if refineries:
+            best = min(
+                refineries,
+                key=lambda b: self._cell_distance(
+                    harvester.cell_x,
+                    harvester.cell_y,
+                    b.cell_x if b.cell_x > 0 else b.pos_x // 1024,
+                    b.cell_y if b.cell_y > 0 else b.pos_y // 1024,
+                ),
+            )
+            return (
+                best.cell_x if best.cell_x > 0 else best.pos_x // 1024,
+                best.cell_y if best.cell_y > 0 else best.pos_y // 1024,
+            )
+        return self._base_center(obs)
 
     def _pending_build_cost(self, obs: OpenRAObservation) -> int:
         if self._build_index >= len(BUILD_ORDER):
@@ -955,10 +1150,22 @@ class NormalAIBot:
         current = sum(1 for u in obs.units if u.type == item_type)
         return current >= limit
 
+    def _current_unit_count(self, obs: OpenRAObservation, item_type: str) -> int:
+        return sum(1 for u in obs.units if u.type == item_type)
+
     def _harvester_target(self, obs: OpenRAObservation) -> int:
         refinery_count = sum(1 for b in obs.buildings if b.type == "proc")
         target = max(INITIAL_HARVESTERS, refinery_count)
-        return min(target, UNIT_LIMITS.get("harv", target))
+        target = min(target, UNIT_LIMITS.get("harv", target))
+        if self._in_recovery_mode(obs):
+            recovery_cap = 0 if refinery_count == 0 else 2 if refinery_count == 1 else RECOVERY_HARVESTER_CAP
+            target = min(target, recovery_cap)
+        return target
+
+    def _should_delay_harvester_request(self, obs: OpenRAObservation, current_harvesters: int) -> bool:
+        if not self._in_recovery_mode(obs):
+            return False
+        return current_harvesters >= self._harvester_target(obs) and self._combat_unit_count(obs) < RECOVERY_EXIT_COMBAT
 
     def _desired_unit_share(
         self,
@@ -993,9 +1200,19 @@ class NormalAIBot:
             elif item_type in {"apc", "jeep", "ftrk"}:
                 share = int(share * 1.1)
 
+        if self._in_recovery_mode(obs):
+            if item_type in AIRCRAFT_TYPES:
+                return 0
+            if item_type in {"e1", "e3", "apc", "jeep", "ftrk", "1tnk", "2tnk", "arty", "v2rl"}:
+                share = int(share * 1.25)
+            elif item_type in {"4tnk", "ttnk", "stnk"}:
+                share = int(share * 0.7)
+
         return share
 
     def _ensure_mcv_requests(self, obs: OpenRAObservation):
+        if self._in_recovery_mode(obs):
+            return
         if self._build_index < len(BUILD_ORDER):
             return
         if not any(b.type in WAR_FACTORY_TYPES for b in obs.buildings):
@@ -1052,6 +1269,30 @@ class NormalAIBot:
         avg_x = sum(u.cell_x for u in squad_units) / len(squad_units)
         avg_y = sum(u.cell_y for u in squad_units) / len(squad_units)
         return min(squad_units, key=lambda u: (u.cell_x - avg_x) ** 2 + (u.cell_y - avg_y) ** 2)
+
+    def _attack_wave_units(
+        self,
+        obs: OpenRAObservation,
+        squad_units: list[UnitInfoModel],
+    ) -> list[UnitInfoModel]:
+        base_center = self._base_center(obs)
+        if base_center is None or self._base_under_pressure(obs):
+            return squad_units
+
+        reserve = max(HOME_GUARD_MIN_RESERVE, len(squad_units) // 5)
+        reserve = min(HOME_GUARD_MAX_RESERVE, reserve)
+        reserve = min(reserve, max(0, len(squad_units) - max(10, self._assault_threshold // 2)))
+        if reserve <= 0:
+            return squad_units
+
+        bx, by = base_center
+        nearest_to_base = sorted(
+            squad_units,
+            key=lambda u: self._cell_distance(u.cell_x, u.cell_y, bx, by),
+        )
+        reserve_ids = {u.actor_id for u in nearest_to_base[:reserve]}
+        attackers = [u for u in squad_units if u.actor_id not in reserve_ids]
+        return attackers or squad_units
 
     def _regroup_squad_commands(
         self,

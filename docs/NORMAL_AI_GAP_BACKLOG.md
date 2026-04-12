@@ -19,6 +19,26 @@ This document now prioritizes a practical goal:
 - specifically, push it toward reliably defeating the OpenRA `EasyAI`
 - do not treat full C# `NormalAI` parity as the immediate success criterion
 
+## Optimization Principles
+
+The OpenRA `NormalAI` in `../openra-rl/openra` should be treated as the
+optimized baseline from the original development team.
+
+When choosing what to implement next, prefer this order of reasoning:
+
+1. Follow the real OpenRA bot behavior when the current RL bridge exposes enough
+   information to do so.
+2. When exact parity is not possible, build the closest stable approximation
+   rather than inventing unrelated heuristics.
+3. Only prefer bridge-specific tuning over source behavior when the OpenRA
+   design clearly does not transfer under the exposed observations/actions.
+
+In short:
+
+- source-aligned first
+- bridge-aware second
+- ad hoc heuristics last
+
 ## Source Of Truth
 
 Primary reference files:
@@ -55,6 +75,8 @@ The Python bot now has:
   - local target prioritization
   - limited regrouping
   - simple local attack/flee gating
+  - a first post-contact recovery / stabilization loop
+  - basic harvester-preservation behavior under visible threat
 
 Observed directionally positive result:
 
@@ -67,6 +89,11 @@ Observed directionally positive result:
 - a later combat pass improved visible target choice and squad behavior, but
   still did not make the bot reliably survive or win against stronger early
   pressure
+- a later stabilization pass materially improved survival and trading after the
+  first major fight, but still did not reach reliable `EasyAI` wins
+- a later economy-preservation pass brought the implementation closer to the
+  OpenRA harvester/recovery intent, but validation still showed meaningful
+  variance between runs
 
 The Python bot still does not have full parity with OpenRA's `NormalAI`, but
 full parity is not required for the current target of building a much stronger
@@ -154,6 +181,7 @@ Python status:
   - idle harvester `HARVEST`
   - harvester replacement requests toward target count
   - simplified target-count logic for more than one harvester
+  - basic visible-threat retreat toward refineries/base
 
 Status:
 - `partial`
@@ -162,6 +190,7 @@ What is still feasible:
 - add threat-based retreat heuristics using visible enemies
 - add cooldowns to avoid spamming the same harvester
 - tune harvester targets so the bot does not overspend on harvesters late
+- rebuild refinery/economy state more reliably after major combat losses
 
 What is blocked:
 - exact resource-aware reassignment
@@ -169,6 +198,10 @@ What is blocked:
 
 Priority for current goal:
 - `high`
+
+Why:
+- long-lasting games still depend heavily on keeping the ore loop alive after
+  the first major battle
 
 ### 3. BaseBuilder placement search
 
@@ -273,6 +306,9 @@ Python status:
   - basic focus fire
   - limited regrouping around a squad leader
   - a simple local attack/flee gate
+  - temporary recovery mode after major post-contact army loss
+  - reduced recovery-time eco/expansion greed
+  - a small reserve kept home for remote attacks
 - much closer timers/thresholds than before, but still not a real OpenRA
   squad-state implementation
 
@@ -289,6 +325,8 @@ What is feasible now:
 - better target prioritization against production, economy, and exposed units
 - better post-contact stabilization after the first engagement
 - better handoff between base defense and field assault
+- better logic for when recovery mode should clear versus keep rebuilding
+- less wasteful emergency-defense spending while rebuilding
 
 What remains difficult:
 - exact state-machine parity
@@ -300,6 +338,8 @@ Priority for current goal:
 Why:
 - beating `EasyAI` depends much more on attack quality and force commitment than
   on exact bot parity features like support powers
+- but the remaining gains now likely come from combining combat follow-through
+  with stronger economic recovery, not from raw aggression alone
 
 ### 6. PowerDownBotModule full toggle behavior
 
@@ -439,15 +479,16 @@ impact improvements available under the current bridge:
    - add cooldowns after failed or low-value dynamic build decisions
    - improve placement target selection for defenses and utility structures
 
-2. Continue the combat pass from "partial" to "strong".
+2. Continue the combined combat-plus-economy stabilization pass.
    - improve post-contact stabilization after the first clash
    - avoid collapsing the home base while the main army is committed
    - make retreat/re-engage logic less binary
    - keep focus fire on live, high-value targets only
 
-3. Tune economy and production for actual strength, not just parity.
+3. Strengthen long-game economy in an OpenRA-aligned way.
+   - preserve harvesters under visible threat
+   - rebuild refinery/economy state reliably after major losses
    - cap overproduction of harvesters
-   - keep a better army mix against ground armies
    - make sure expansion and dynamic building do not starve combat production
 
 4. Improve coarse expansion only after the main-base bot is already strong.
