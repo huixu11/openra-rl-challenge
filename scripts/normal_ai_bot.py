@@ -167,7 +167,7 @@ RESOURCE_PATCH_SEARCH_MARGIN = 8
 RESOURCE_PATCH_THREAT_RADIUS = 12
 RESOURCE_PATCH_REFINERY_DISLIKE_RADIUS = 14
 MAX_REFINERIES_PER_PATCH = 2
-NAVAL_CANDIDATE_MIN_COUNT = 6
+NAVAL_CANDIDATE_MIN_COUNT = 1
 
 ATTACK_FORCE_INTERVAL = 75
 RUSH_INTERVAL = 600
@@ -1369,6 +1369,16 @@ class NormalAIBot:
             return False
         return self._terrain_index_at(x, y) in {7, 8}
 
+    def _is_open_water_cell(self, x: int, y: int) -> bool:
+        w, h = self._get_map_size()
+        if x <= 0 or y <= 0 or x >= w - 1 or y >= h - 1:
+            return False
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if not self._is_water_candidate_cell(x + dx, y + dy):
+                    return False
+        return True
+
     def _local_resource_score(self, x: int, y: int, radius: int) -> float:
         total = 0.0
         for dx in range(-radius, radius + 1):
@@ -1599,7 +1609,7 @@ class NormalAIBot:
         max_radius: int,
     ) -> list[tuple[int, int]]:
         if item_type in NAVAL_STRUCTURE_TYPES:
-            naval_candidates = self._shoreline_candidates(obs, (cx, cy), min_radius, max_radius)
+            naval_candidates = self._naval_build_candidates(obs, (cx, cy), 1, CHECK_FOR_WATER_RADIUS)
             if naval_candidates:
                 return naval_candidates
 
@@ -1942,38 +1952,26 @@ class NormalAIBot:
 
         return None if best is None else best[1]
 
-    def _shoreline_candidates(
+    def _naval_build_candidates(
         self,
         obs: OpenRAObservation,
         anchor: Tuple[int, int],
         min_radius: int,
         max_radius: int,
     ) -> list[tuple[int, int]]:
-        buildings = [
-            (
-                b.cell_x if b.cell_x > 0 else b.pos_x // 1024,
-                b.cell_y if b.cell_y > 0 else b.pos_y // 1024,
-            )
-            for b in obs.buildings
-        ]
         w, h = self._get_map_size()
         candidates: list[tuple[int, int]] = []
         for radius in range(min_radius, max_radius + 1):
             for dx in range(-radius, radius + 1):
                 for dy in range(-radius, radius + 1):
-                    if max(abs(dx), abs(dy)) != radius:
+                    dist_sq = dx * dx + dy * dy
+                    if dist_sq > radius * radius or dist_sq < max(0, radius - 1) * max(0, radius - 1):
                         continue
                     x = anchor[0] + dx
                     y = anchor[1] + dy
                     if x < 0 or y < 0 or x >= w or y >= h:
                         continue
-                    if not self._is_water_candidate_cell(x, y):
-                        continue
-                    if self._local_water_score(x, y, 1) < 3:
-                        continue
-                    if not any(self._is_passable_cell(x + ox, y + oy) for ox, oy in ((1, 0), (-1, 0), (0, 1), (0, -1))):
-                        continue
-                    if buildings and min(self._cell_distance(x, y, bx, by) for bx, by in buildings) > CHECK_FOR_WATER_RADIUS:
+                    if not self._is_open_water_cell(x, y):
                         continue
                     candidates.append((x, y))
         return candidates
@@ -1986,7 +1984,7 @@ class NormalAIBot:
                 building.cell_x if building.cell_x > 0 else building.pos_x // 1024,
                 building.cell_y if building.cell_y > 0 else building.pos_y // 1024,
             )
-            count = len(self._shoreline_candidates(obs, anchor, BASE_BUILD_MIN_RADIUS, BASE_BUILD_MAX_RADIUS))
+            count = len(self._naval_build_candidates(obs, anchor, 1, CHECK_FOR_WATER_RADIUS))
             if count > best_count:
                 best_count = count
                 best_anchor = anchor

@@ -70,7 +70,7 @@ The Python bot now has:
 - broader `BaseBuilderBotModule` placement annuli (`2..20`, defenses `5..20`)
 - refinery placement biased toward nearby resource patches instead of only the first conyard ring
 - broader `NormalAI` land-building coverage, including `gap` and `mslo`
-- conservative terrain-index plus shoreline-gated naval structure logic for `spen` / `syrd`
+- conservative terrain-index plus open-water-gated naval structure logic for `spen` / `syrd`
 - variant-aware handling for `afld` / `afld.ukraine`
 - source-like structure-production pacing (`25` / `125` tick checks with random bonus)
 - bridge-compatible structure placement backoff / resume using `CANCEL_PRODUCTION`
@@ -251,8 +251,8 @@ Python status:
 - now uses broader annulus targets closer to source defaults
 - now biases refinery placement toward coarse resource patches from `spatial_map`
 - now has bridge-compatible failed-placement cancel/backoff/resume logic
-- now gates naval structures behind terrain-index-validated shoreline candidate
-  checks near the base
+- now gates naval structures behind terrain-index-validated open-water candidate
+  checks inside the current buildable area
 - still does not have the real legality-aware placement search from OpenRA
 - still does not have exact `CanPlaceBuilding` legality checks
 - still does not have exact water/buildability parity for naval placement
