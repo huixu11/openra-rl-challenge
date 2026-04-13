@@ -70,7 +70,9 @@ The Python bot now has:
 - broader `BaseBuilderBotModule` placement annuli (`2..20`, defenses `5..20`)
 - refinery placement biased toward nearby resource patches instead of only the first conyard ring
 - broader `NormalAI` land-building coverage, including `gap` and `mslo`
-- conservative terrain-index plus open-water-gated naval structure logic for `spen` / `syrd`
+- footprint-valid, shoreline-scored naval anchor selection for `spen` / `syrd`
+- a constrained early-naval override that opens earlier on real naval spawns
+  without reopening naval spam on `singles.oramap`
 - variant-aware handling for `afld` / `afld.ukraine`
 - source-like structure-production pacing (`25` / `125` tick checks with random bonus)
 - bridge-compatible structure placement backoff / resume using `CANCEL_PRODUCTION`
@@ -112,6 +114,9 @@ Observed directionally positive result:
 - a later harvester/resource-map pass issued targeted patch-based `HARVEST`
   commands by tick `12000` in direct validation, confirming that the Python bot
   now reassigns harvesters using coarse resource-patch signals
+- a later naval-placement pass issued real `build` / `place_building` attempts
+  for `spen` on `bombardment-islands.oramap` by ticks `6122` / `6604`,
+  while a longer `singles.oramap` validation still showed zero naval attempts
 
 The Python bot still does not have full parity with OpenRA's `NormalAI`, but
 full parity is not required for the current target of building a much stronger
@@ -150,6 +155,29 @@ The current RL bridge is enough to continue improving:
 
 RL bridge changes become more important when the goal shifts from "make the bot
 much better" to "match the real OpenRA C# bot closely."
+
+## Comparison Snapshot
+
+Compared with the real OpenRA `NormalAI` in `../OpenRA-RL/OpenRA`:
+
+- `BaseBuilderBotModule@normal`:
+  Python now matches the main RA YAML macro constants closely, including
+  `NewProductionCashThreshold`, `NavalProductionTypes`, structure fractions,
+  limits, and delays. It now also approximates the source naval water gate with
+  footprint-valid shoreline anchors instead of raw water-cell guesses.
+- `BaseBuilderQueueManager`:
+  Python still does not have the C# `world.CanPlaceBuilding(...)` legality
+  search, true `AIUtils.IsAreaAvailable<BaseProvider/GivesBuildableArea>(...)`
+  checks, or exact buildings-being-produced accounting. Naval placement is now
+  materially closer to source intent, but still remains an approximation.
+- `HarvesterBotModule` / `ResourceMapBotModule`:
+  Python now has a useful coarse `spatial_map` approximation, but not the true
+  OpenRA indice grid, threat summaries, or low-effect harvester scoring.
+- `SquadManagerBotModule` / `UnitBuilderBotModule`:
+  Python is still meaningfully simpler than source OpenRA. It has source-like
+  production shares and much better combat behavior than before, but not the
+  real assault/rush/protection/air/naval squad state machines or full unit
+  builder parity.
 
 ## Gap List
 
@@ -251,14 +279,35 @@ Python status:
 - now uses broader annulus targets closer to source defaults
 - now biases refinery placement toward coarse resource patches from `spatial_map`
 - now has bridge-compatible failed-placement cancel/backoff/resume logic
-- now gates naval structures behind terrain-index-validated open-water candidate
-  checks inside the current buildable area
+- now gates naval structures behind footprint-valid naval anchors scored from
+  shoreline evidence and constrained to the current buildable area
+- now opens naval production earlier on real naval spawns once the bot has a
+  basic land core and enough credits for the actual naval structure plus a
+  small reserve
 - still does not have the real legality-aware placement search from OpenRA
 - still does not have exact `CanPlaceBuilding` legality checks
-- still does not have exact water/buildability parity for naval placement
+- still does not have exact OpenRA `IsAreaAvailable(...)` water/base-provider
+  parity for naval placement
 
 Status:
 - `partial`
+
+What this gap no longer includes:
+- raw open-water-cell naval guesses that were not tied to a real naval
+  footprint
+- naval openings that stayed closed on `bombardment-islands.oramap`
+- naval false positives on `singles.oramap` from the recent shoreline pass
+
+Comparison against source:
+- OpenRA source still only considers naval production as a high-cash priority
+  override above `NewProductionCashThreshold` (`8000`) when water/base-area
+  checks pass in `BaseBuilderQueueManager.cs`.
+- Python intentionally diverges here with an earlier, map-specific naval
+  override once a strong naval anchor exists and the bot can already afford the
+  naval structure plus a small cash buffer.
+- This deviation is deliberate under the RL bridge: without it, real naval
+  spawn maps were often reaching the refinery/land-production loop without any
+  naval attempt before the game state had already effectively closed.
 
 What is feasible now:
 - use richer annulus search patterns and retry tracking
