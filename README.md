@@ -6,7 +6,7 @@ Training scripts for **OpenRA-RL** — an environment that lets AI agents play *
 
 The published image (`ghcr.io/yxc20089/openra-rl:latest`) has a critical bug: the AI opponent never spawns, so every game is played against nobody and you get zero combat data. This repo includes two key files that fix this:
 
-- **`Dockerfile`** — Builds the game server from source, pinned to commit `cbe7c9e859` that includes the AI bot spawn fix. It clones both the OpenRA C# engine and the OpenRA-RL Python server from GitHub automatically — no other repos needed.
+- **`Dockerfile`** — Builds the game server from source, pinned to commit `2e26b31c0f28b75d140e11d9023b56b17715adea` that includes the AI bot spawn fix. It clones both the OpenRA C# engine and the OpenRA-RL Python server from GitHub automatically — no other repos needed.
 - **`scripts/scripted_bot.py`** — Vendored copy of the base `ScriptedBot` class from `OpenRA-RL/examples/`. This removes the need to have the `OpenRA-RL` repo cloned as a sibling directory. `collect_bot_data.py` imports it directly.
 
 See [Bugs Found & Fixed](#bugs-found--fixed) for the full list of 9 bugs fixed.
@@ -26,7 +26,7 @@ cd openra-rl-challenge
 docker build -t openra-rl:local .
 
 # 2. Start the server
-docker run -d -p 8000:8000 --name openra-rl-server -e BOT_TYPE=normal openra-rl:local
+docker run -d -p 8000:8000 --name openra-rl-server -e BOT_TYPE=easy openra-rl:local
 
 # 3. Wait ~30 seconds, then verify it's up
 curl http://localhost:8000/health
@@ -103,7 +103,7 @@ The published Docker image (`ghcr.io/yxc20089/openra-rl:latest`) has bugs that p
 
 | # | Bug | Root Cause | Fix |
 |---|-----|-----------|-----|
-| 1 | **AI opponent never spawns** (critical) | `OpenRA.Game.dll` is built from an old commit missing `spectate` and `slot_bot` lobby commands in `LoadMap`. The AI player slot is silently dropped. | Dockerfile pins OpenRA to commit `cbe7c9e859` which includes fix `8c96a76b4c`. |
+| 1 | **AI opponent never spawns** (critical) | `OpenRA.Game.dll` is built from an old commit missing `spectate` and `slot_bot` lobby commands in `LoadMap`. The AI player slot is silently dropped. | Dockerfile pins OpenRA to commit `2e26b31c0f28b75d140e11d9023b56b17715adea` which includes fix `8c96a76b4c`. |
 | 2 | **Invalid bot type** | `BOT_TYPE=hard` is passed directly to OpenRA, which only accepts `rush`/`normal`/`turtle`/`naval`. Unrecognized types are silently ignored. | Rebuilt image includes `BOT_TYPE_MAP` that translates `hard` -> `normal`. |
 
 ### Script bugs (fixed in `collect_bot_data.py`)

@@ -1,6 +1,6 @@
 # Normal AI Gap Backlog
 
-Last updated: 2026-04-12
+Last updated: 2026-04-13
 
 ## Purpose
 
@@ -62,8 +62,19 @@ The Python bot now has:
 - total-credit accounting (`cash + ore`)
 - basic harvester replacement requests
 - idle harvester `HARVEST`
+- targeted harvester reassignment toward better coarse resource patches
 - OpenRA-like unit production timing and requested build handling
-- more OpenRA-like building fractions, delays, and refinery/power priorities
+- source-correct building costs for the main `NormalAI` land-building set
+- closer-to-source building fractions, limits, delays, and refinery/power priorities
+- coarse `spatial_map`-backed resource patch clustering for refinery and expansion targeting
+- broader `BaseBuilderBotModule` placement annuli (`2..20`, defenses `5..20`)
+- refinery placement biased toward nearby resource patches instead of only the first conyard ring
+- broader `NormalAI` land-building coverage, including `gap` and `mslo`
+- conservative terrain-index plus shoreline-gated naval structure logic for `spen` / `syrd`
+- variant-aware handling for `afld` / `afld.ukraine`
+- source-like structure-production pacing (`25` / `125` tick checks with random bonus)
+- bridge-compatible structure placement backoff / resume using `CANCEL_PRODUCTION`
+- stronger reservation for mandatory refinery / power structure spend
 - periodic repair behavior
 - remembered power toggle behavior
 - staged attack thresholds closer to `SquadManagerBotModule@normal`
@@ -94,10 +105,21 @@ Observed directionally positive result:
 - a later economy-preservation pass brought the implementation closer to the
   OpenRA harvester/recovery intent, but validation still showed meaningful
   variance between runs
+- a later spatial-map/basebuilder pass moved the first dynamic second-refinery
+  build forward to roughly `1.1` minutes in a fresh `3` minute validation on
+  `singles.oramap`, instead of appearing only near the end of the time-limit
+  window
+- a later harvester/resource-map pass issued targeted patch-based `HARVEST`
+  commands by tick `12000` in direct validation, confirming that the Python bot
+  now reassigns harvesters using coarse resource-patch signals
 
 The Python bot still does not have full parity with OpenRA's `NormalAI`, but
 full parity is not required for the current target of building a much stronger
 bot that can beat easier opponents.
+
+When `EasyAI` appears to develop a richer or broader base than the Python bot,
+that should be treated as a remaining Python-port gap, not as proof that source
+OpenRA `EasyAI` is meant to economically out-develop source `NormalAI`.
 
 ## Practical Goal
 
@@ -144,25 +166,29 @@ What OpenRA has:
 - inputs for harvester reassignment and MCV expansion
 
 Python status:
-- no equivalent resource map
+- now parses `spatial_map` into coarse resource patches
+- now uses those patches for refinery-target bias and expansion-target bias
+- still does not reproduce OpenRA's true per-indice threat/resource bookkeeping
 
 Why it matters:
 - this is a central dependency for smart refinery placement, harvester
   reassignment, and MCV expansion
 
 Status:
-- `blocked by API`
+- `partial`
 
-Reason:
-- current observations do not expose resource cell locations, resource creator
-  positions, or the derived resource-map grid used by OpenRA
+What is still missing:
+- exact OpenRA indice/grid scoring
+- nearby-indice threat summaries instead of simple visible-enemy counting
+- resource-creator actor inputs
+- harvester reassignment driven by patch saturation / low-yield detection
 
 Priority for current goal:
-- `medium`, not `highest`
+- `high`
 
 Why:
-- this blocks full parity, but it does not block large improvements against
-  easier opponents
+- the bridge now exposes enough map data for a useful approximation, so this is
+  no longer blocked and should be used more aggressively in economy logic
 
 ### 2. HarvesterBotModule: low-effect reassignment and flee-to-dock
 
@@ -177,23 +203,25 @@ What OpenRA has beyond current Python bot:
 - no-resource cooldown logic
 
 Python status:
-- currently only:
+- now has:
   - idle harvester `HARVEST`
   - harvester replacement requests toward target count
   - simplified target-count logic for more than one harvester
   - basic visible-threat retreat toward refineries/base
+  - coarse patch-based targeted harvester reassignment using `spatial_map`
+    resource clustering
+  - cooldowns to avoid reassign-spam on the same harvester
 
 Status:
 - `partial`
 
 What is still feasible:
-- add threat-based retreat heuristics using visible enemies
-- add cooldowns to avoid spamming the same harvester
+- add stronger threat-based retreat heuristics using visible enemies
 - tune harvester targets so the bot does not overspend on harvesters late
 - rebuild refinery/economy state more reliably after major combat losses
 
 What is blocked:
-- exact resource-aware reassignment
+- exact resource-aware reassignment parity with OpenRA's indice grid
 - exact dock behavior if the RL bridge does not expose a dedicated dock action
 
 Priority for current goal:
@@ -213,13 +241,21 @@ What OpenRA has:
 - refinery placement near resource regions
 - defense placement toward enemy base
 - failed-placement backoff and retry windows
+- buildings-being-produced accounting during build choice
+- water-aware gating for naval production structures
 - variant-aware placement
 
 Python status:
 - now correctly places completed items from both `Building` and `Defense`
   queues, which fixed the worst late-game build-churn issue
-- still uses a simplified placement approach around the conyard
-- still does not have the real failure-aware placement search from OpenRA
+- now uses broader annulus targets closer to source defaults
+- now biases refinery placement toward coarse resource patches from `spatial_map`
+- now has bridge-compatible failed-placement cancel/backoff/resume logic
+- now gates naval structures behind terrain-index-validated shoreline candidate
+  checks near the base
+- still does not have the real legality-aware placement search from OpenRA
+- still does not have exact `CanPlaceBuilding` legality checks
+- still does not have exact water/buildability parity for naval placement
 
 Status:
 - `partial`
@@ -227,19 +263,22 @@ Status:
 What is feasible now:
 - use richer annulus search patterns and retry tracking
 - bias defense placement toward the known enemy base
-- add better retry/backoff when placement choices repeatedly fail
+- use coarse resource patches to steer refinery and expansion placement
+- keep the widened retry sweep and queue backoff tied to source `BaseBuilder`
+  intent under bridge constraints
 - improve placement quality for defenses, tech, and utility structures
+- keep land-macro structure selection aligned to `BaseBuilderBotModule@normal`
 
 What is blocked:
 - exact legality-aware search without buildability queries
-- proper refinery placement near resource fields without resource map data
+- exact naval placement parity without true water/buildability visibility
 
 Priority for current goal:
-- `very high`
+- `high`
 
 Why:
-- placement quality still matters a lot, but the worst structure-queue churn
-  bug has already been fixed
+- source-like macro is materially closer now, but crowded-base legality and
+  exact naval placement still matter for consistency
 
 ### 4. UnitBuilderBotModule full parity
 
@@ -474,10 +513,10 @@ Why:
 For the goal of defeating `EasyAI`, the next work should focus on the highest
 impact improvements available under the current bridge:
 
-1. Fix build churn and placement/backoff behavior.
-   - stop repeated silo spam
-   - add cooldowns after failed or low-value dynamic build decisions
-   - improve placement target selection for defenses and utility structures
+1. Push the new coarse resource-map data deeper into economy and expansion.
+   - add harvester reassignment toward better patches where feasible
+   - use patch saturation to decide when refinery recovery / rebuild should happen
+   - keep expansion target choice tied to real resource patches instead of only grid search
 
 2. Continue the combined combat-plus-economy stabilization pass.
    - improve post-contact stabilization after the first clash
@@ -485,18 +524,20 @@ impact improvements available under the current bridge:
    - make retreat/re-engage logic less binary
    - keep focus fire on live, high-value targets only
 
-3. Strengthen long-game economy in an OpenRA-aligned way.
+3. Tighten the remaining `BaseBuilderBotModule` consistency gaps.
+   - reduce false placement retries in crowded bases
+   - refine build-order retry behavior when placement fails repeatedly
+   - keep naval placement conservative unless shoreline evidence is strong
+
+4. Strengthen long-game economy in an OpenRA-aligned way.
    - preserve harvesters under visible threat
    - rebuild refinery/economy state reliably after major losses
    - cap overproduction of harvesters
    - make sure expansion and dynamic building do not starve combat production
 
-4. Improve coarse expansion only after the main-base bot is already strong.
-   - second MCV timing
-   - safer deployment heuristics
-
 5. Treat RL bridge changes as optional phase 2.
-   - resource map exposure
+   - exact buildability / legality exposure
+   - explicit water-terrain exposure
    - support powers
    - richer attack-event/state signals
 
@@ -506,12 +547,14 @@ Within the current RL API, the Python bot should be considered "good enough"
 when it has:
 
 - stable economy with multiple harvesters
+- multiple refineries once the base has production online
+- coarse resource-map-backed refinery / expansion choices from `spatial_map`
 - a second conyard/MCV expansion path
-- production and building choices close to OpenRA defaults
+- source-correct macro costs and production/building choices close to OpenRA defaults
 - no obviously broken power or repair behavior
 - delayed/staged assaults closer to real NormalAI
-- no obvious late-game build spam or placement churn
+- no obvious late-game build spam or repeated placement churn
 - can consistently perform competitively against `EasyAI`
 
-Full parity with the C# bot is not possible without additional observation and
-action support from the RL bridge.
+Full parity with the C# bot is still not possible without exact buildability /
+water semantics and some richer bot-state support from the RL bridge.

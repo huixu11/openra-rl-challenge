@@ -7,7 +7,7 @@
 #
 # Usage:
 #   docker build -t openra-rl:local .
-#   docker run -d -p 8000:8000 --name openra-rl-server -e BOT_TYPE=hard openra-rl:local
+#   docker run -d -p 8000:8000 --name openra-rl-server -e BOT_TYPE=easy openra-rl:local
 # ==============================================================================
 
 # --- Stage 1: Build OpenRA C# game engine from source ---
@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # but predates the protobuf-incompatible interrupt changes.
 ARG OPENRA_REPO=https://github.com/yxc20089/OpenRA.git
 ARG OPENRA_BRANCH=bleed
-ARG OPENRA_COMMIT=cbe7c9e859
+ARG OPENRA_COMMIT=2e26b31c0f28b75d140e11d9023b56b17715adea
 RUN git clone --branch "$OPENRA_BRANCH" "$OPENRA_REPO" /src/openra && \
     cd /src/openra && git checkout "$OPENRA_COMMIT"
 WORKDIR /src/openra
@@ -114,7 +114,7 @@ ENV DOTNET_ROLL_FORWARD=LatestMajor
 ENV LIBGL_ALWAYS_SOFTWARE=1
 ENV MESA_GL_VERSION_OVERRIDE=3.3
 ENV AI_SLOT=Multi0
-ENV BOT_TYPE=beginner
+ENV BOT_TYPE=easy
 ENV RECORD_REPLAYS=true
 
 EXPOSE 8000
