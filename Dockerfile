@@ -17,11 +17,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     make git libsdl2-dev libopenal-dev libfreetype-dev liblua5.1-0-dev ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Pin to a known-good commit that includes the AI bot fix (slot_bot/spectate)
-# but predates the protobuf-incompatible interrupt changes.
+# Pin to a known-good OpenRA revision with the RL bridge placement fallback fix.
 ARG OPENRA_REPO=https://github.com/yxc20089/OpenRA.git
 ARG OPENRA_BRANCH=bleed
-ARG OPENRA_COMMIT=2e26b31c0f28b75d140e11d9023b56b17715adea
+ARG OPENRA_COMMIT=8a5d224223e0498e006a7350a9767a87bd45a708
 RUN git clone --branch "$OPENRA_BRANCH" "$OPENRA_REPO" /src/openra && \
     cd /src/openra && git checkout "$OPENRA_COMMIT"
 WORKDIR /src/openra
@@ -29,7 +28,6 @@ WORKDIR /src/openra
 RUN find . -name '*.sh' -exec sed -i 's/\r$//' {} + && \
     find . -name '*.sh' -exec chmod +x {} +
 
-ENV SKIP_PROTOC=true
 RUN make TARGETPLATFORM=unix-generic CONFIGURATION=Release
 
 RUN test -f bin/OpenRA.dll && \

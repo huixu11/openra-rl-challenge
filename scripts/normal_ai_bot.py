@@ -85,6 +85,62 @@ BUILDING_VARIANT_CHOICES: dict[str, tuple[str, ...]] = {
     "afld": ("afld", "afld.ukraine"),
 }
 BUILDING_CANONICAL_TYPES: dict[str, str] = {"afld.ukraine": "afld"}
+BUILDING_DIMENSIONS: dict[str, tuple[int, int]] = {
+    "powr": (2, 3),
+    "apwr": (3, 3),
+    "proc": (3, 4),
+    "weap": (3, 4),
+    "barr": (2, 3),
+    "tent": (2, 3),
+    "dome": (2, 3),
+    "atek": (2, 3),
+    "hpad": (2, 3),
+    "afld": (3, 2),
+    "afld.ukraine": (3, 2),
+    "fix": (3, 3),
+    "stek": (3, 3),
+    "spen": (3, 3),
+    "syrd": (3, 3),
+    "sam": (2, 1),
+    "mslo": (2, 1),
+    "silo": (2, 1),
+    "kenn": (2, 2),
+    "pbox": (2, 1),
+    "hbox": (2, 1),
+    "gun": (2, 2),
+    "ftur": (2, 2),
+    "tsla": (2, 2),
+    "agun": (2, 2),
+    "gap": (3, 3),
+}
+BUILDING_TOPLEFT_OFFSETS: dict[str, tuple[int, int]] = {
+    "powr": (1, 1),
+    "apwr": (1, 1),
+    "proc": (1, 1),
+    "weap": (1, 1),
+    "barr": (1, 1),
+    "tent": (1, 1),
+    "dome": (1, 1),
+    "atek": (1, 1),
+    "hpad": (1, 1),
+    "afld": (1, 1),
+    "afld.ukraine": (1, 1),
+    "fix": (1, 1),
+    "stek": (1, 1),
+    "spen": (1, 1),
+    "syrd": (1, 1),
+    "sam": (1, 0),
+    "mslo": (1, 0),
+    "silo": (1, 0),
+    "kenn": (1, 1),
+    "pbox": (1, 0),
+    "hbox": (1, 0),
+    "gun": (1, 1),
+    "ftur": (1, 1),
+    "tsla": (1, 1),
+    "agun": (1, 1),
+    "gap": (1, 1),
+}
 
 BUILDING_COSTS: dict[str, int] = {
     "powr": 300, "apwr": 500, "proc": 1400, "weap": 2000,
@@ -154,6 +210,7 @@ STRUCTURE_PRODUCTION_INACTIVE_DELAY = 125
 STRUCTURE_PRODUCTION_RANDOM_BONUS_DELAY = 10
 STRUCTURE_PRODUCTION_RESUME_DELAY = 1500
 PLACEMENT_ATTEMPT_INTERVAL = 25
+PLACEMENT_CONFIRMATION_DELAY = 300
 MAX_FAILED_PLACEMENT_ATTEMPTS = 8
 BASE_BUILD_MIN_RADIUS = 2
 BASE_BUILD_MAX_RADIUS = 20
@@ -367,11 +424,14 @@ class NormalAIBot:
                 current_count = counts.get(self._canonical_building_type(prod.item), 0)
                 if pending is not None:
                     pending_item, pending_count, pending_tick = pending
-                    if pending_item == prod.item and obs.tick > pending_tick:
-                        if current_count <= pending_count:
-                            self._placement_fail_counts[queue_type] = self._placement_fail_counts.get(queue_type, 0) + 1
-                        else:
+                    if pending_item == prod.item:
+                        if current_count > pending_count:
                             self._placement_fail_counts[queue_type] = 0
+                            self._placement_pending.pop(queue_type, None)
+                            continue
+                        if obs.tick < pending_tick + PLACEMENT_CONFIRMATION_DELAY:
+                            continue
+                        self._placement_fail_counts[queue_type] = self._placement_fail_counts.get(queue_type, 0) + 1
                         self._placement_pending.pop(queue_type, None)
                     elif pending_item != prod.item:
                         self._placement_pending.pop(queue_type, None)
@@ -400,7 +460,12 @@ class NormalAIBot:
                 if obs.tick < self._next_placement_attempt_tick.get(queue_type, -9999):
                     continue
 
-                x, y = self._placement_offset(obs, cy, prod.item)
+                location = self._placement_offset(obs, cy, prod.item)
+                if location is None:
+                    self._placement_fail_counts[queue_type] = self._placement_fail_counts.get(queue_type, 0) + 1
+                    self._next_placement_attempt_tick[queue_type] = obs.tick + PLACEMENT_ATTEMPT_INTERVAL
+                    continue
+                x, y = location
                 commands.append(CommandModel(
                     action=ActionType.PLACE_BUILDING,
                     item_type=prod.item,
@@ -421,7 +486,7 @@ class NormalAIBot:
         obs: OpenRAObservation,
         cy: BuildingInfoModel,
         item_type: str,
-    ) -> Tuple[int, int]:
+    ) -> Optional[Tuple[int, int]]:
         center = self._base_center(obs)
         if center is None:
             center = (
@@ -430,16 +495,17 @@ class NormalAIBot:
             )
         center = self._placement_anchor(obs, item_type, center)
         cx, cy_y = center
+        queue_type = self._structure_queue_type(item_type)
+        retry_index = self._placement_fail_counts.get(queue_type, 0)
 
         min_radius = DEFENSE_BUILD_MIN_RADIUS if item_type in ENEMY_FACING_STRUCTURE_TYPES else BASE_BUILD_MIN_RADIUS
         max_radius = DEFENSE_BUILD_MAX_RADIUS if item_type in ENEMY_FACING_STRUCTURE_TYPES else BASE_BUILD_MAX_RADIUS
+        if item_type not in ENEMY_FACING_STRUCTURE_TYPES:
+            max_radius += min(retry_index * 4, 20)
         candidates = self._placement_candidates(obs, item_type, cx, cy_y, min_radius, max_radius)
 
         if not candidates:
-            return cx + 3, cy_y
-
-        queue_type = self._structure_queue_type(item_type)
-        retry_index = self._placement_fail_counts.get(queue_type, 0)
+            return None
 
         if item_type == "proc":
             plan = self._best_refinery_plan(obs)
@@ -1506,6 +1572,85 @@ class NormalAIBot:
         canonical = self._canonical_building_type(item_type)
         return BUILDING_COSTS.get(item_type, BUILDING_COSTS.get(canonical, 500))
 
+    def _building_dimensions(self, item_type: str) -> tuple[int, int]:
+        canonical = self._canonical_building_type(item_type)
+        return BUILDING_DIMENSIONS.get(item_type, BUILDING_DIMENSIONS.get(canonical, (2, 2)))
+
+    def _building_top_left(self, building: BuildingInfoModel) -> tuple[int, int]:
+        canonical = self._canonical_building_type(building.type)
+        offset_x, offset_y = BUILDING_TOPLEFT_OFFSETS.get(
+            building.type,
+            BUILDING_TOPLEFT_OFFSETS.get(canonical, (0, 0)),
+        )
+        return (
+            (building.cell_x if building.cell_x > 0 else building.pos_x // 1024) - offset_x,
+            (building.cell_y if building.cell_y > 0 else building.pos_y // 1024) - offset_y,
+        )
+
+    def _occupied_building_cells(self, obs: OpenRAObservation) -> set[tuple[int, int]]:
+        occupied: set[tuple[int, int]] = set()
+        for building in obs.buildings:
+            bx, by = self._building_top_left(building)
+            width, height = self._building_dimensions(building.type)
+            for dx in range(width):
+                for dy in range(height):
+                    occupied.add((bx + dx, by + dy))
+        return occupied
+
+    def _footprint_close_enough_to_base(
+        self,
+        top_left_x: int,
+        top_left_y: int,
+        width: int,
+        height: int,
+        base_cells: set[tuple[int, int]],
+        radius: int,
+    ) -> bool:
+        if not base_cells:
+            return False
+        max_x = top_left_x + width - 1
+        max_y = top_left_y + height - 1
+        for bx, by in base_cells:
+            dx = 0 if top_left_x <= bx <= max_x else min(abs(bx - top_left_x), abs(bx - max_x))
+            dy = 0 if top_left_y <= by <= max_y else min(abs(by - top_left_y), abs(by - max_y))
+            if max(dx, dy) <= radius:
+                return True
+        return False
+
+    def _candidate_fits_building_footprint(
+        self,
+        obs: OpenRAObservation,
+        item_type: str,
+        top_left_x: int,
+        top_left_y: int,
+        occupied: Optional[set[tuple[int, int]]] = None,
+    ) -> bool:
+        width, height = self._building_dimensions(item_type)
+        w, h = self._get_map_size()
+        if top_left_x < 0 or top_left_y < 0 or top_left_x + width > w or top_left_y + height > h:
+            return False
+
+        occupied = occupied or self._occupied_building_cells(obs)
+        is_naval = self._canonical_building_type(item_type) in NAVAL_STRUCTURE_TYPES
+        if is_naval and not self._footprint_close_enough_to_base(
+            top_left_x, top_left_y, width, height, occupied, CHECK_FOR_WATER_RADIUS
+        ):
+            return False
+        for dx in range(width):
+            for dy in range(height):
+                cell = (top_left_x + dx, top_left_y + dy)
+                if cell in occupied:
+                    return False
+                if is_naval:
+                    if not self._is_water_candidate_cell(*cell):
+                        return False
+                else:
+                    if not self._is_passable_cell(*cell):
+                        return False
+                    if self._resource_amount_at(*cell) > 0.0:
+                        return False
+        return True
+
     def _schedule_next_build_check(self, obs: OpenRAObservation, active: bool):
         delay = STRUCTURE_PRODUCTION_ACTIVE_DELAY if active else STRUCTURE_PRODUCTION_INACTIVE_DELAY
         random_bonus = random.randrange(STRUCTURE_PRODUCTION_RANDOM_BONUS_DELAY) if STRUCTURE_PRODUCTION_RANDOM_BONUS_DELAY > 0 else 0
@@ -1608,8 +1753,9 @@ class NormalAIBot:
         min_radius: int,
         max_radius: int,
     ) -> list[tuple[int, int]]:
+        occupied = self._occupied_building_cells(obs)
         if item_type in NAVAL_STRUCTURE_TYPES:
-            naval_candidates = self._naval_build_candidates(obs, (cx, cy), 1, CHECK_FOR_WATER_RADIUS)
+            naval_candidates = self._naval_build_candidates(obs, item_type, occupied)
             if naval_candidates:
                 return naval_candidates
 
@@ -1626,14 +1772,12 @@ class NormalAIBot:
                         continue
                     candidates.append((x, y))
 
-        passable = [c for c in candidates if self._is_passable_cell(c[0], c[1])]
-        if passable:
-            candidates = passable
-
-        if item_type not in ENEMY_FACING_STRUCTURE_TYPES:
-            non_resource = [c for c in candidates if self._resource_amount_at(c[0], c[1]) <= 0.0]
-            if non_resource:
-                candidates = non_resource
+        fitting = [
+            c for c in candidates
+            if self._candidate_fits_building_footprint(obs, item_type, c[0], c[1], occupied)
+        ]
+        if fitting:
+            candidates = fitting
 
         return candidates
 
@@ -1955,42 +2099,42 @@ class NormalAIBot:
     def _naval_build_candidates(
         self,
         obs: OpenRAObservation,
-        anchor: Tuple[int, int],
-        min_radius: int,
-        max_radius: int,
+        item_type: str,
+        occupied: Optional[set[tuple[int, int]]] = None,
     ) -> list[tuple[int, int]]:
+        occupied = occupied or self._occupied_building_cells(obs)
+        if not occupied:
+            return []
+
         w, h = self._get_map_size()
+        width, height = self._building_dimensions(item_type)
+        base_xs = [cell[0] for cell in occupied]
+        base_ys = [cell[1] for cell in occupied]
+        min_x = max(0, min(base_xs) - CHECK_FOR_WATER_RADIUS - width)
+        max_x = min(w - width, max(base_xs) + CHECK_FOR_WATER_RADIUS)
+        min_y = max(0, min(base_ys) - CHECK_FOR_WATER_RADIUS - height)
+        max_y = min(h - height, max(base_ys) + CHECK_FOR_WATER_RADIUS)
         candidates: list[tuple[int, int]] = []
-        for radius in range(min_radius, max_radius + 1):
-            for dx in range(-radius, radius + 1):
-                for dy in range(-radius, radius + 1):
-                    dist_sq = dx * dx + dy * dy
-                    if dist_sq > radius * radius or dist_sq < max(0, radius - 1) * max(0, radius - 1):
-                        continue
-                    x = anchor[0] + dx
-                    y = anchor[1] + dy
-                    if x < 0 or y < 0 or x >= w or y >= h:
-                        continue
-                    if not self._is_open_water_cell(x, y):
-                        continue
-                    candidates.append((x, y))
+        for x in range(min_x, max_x + 1):
+            for y in range(min_y, max_y + 1):
+                if not self._candidate_fits_building_footprint(obs, item_type, x, y, occupied):
+                    continue
+                candidates.append((x, y))
         return candidates
 
     def _best_naval_anchor(self, obs: OpenRAObservation) -> Optional[Tuple[int, int]]:
-        best_anchor: Optional[Tuple[int, int]] = None
-        best_count = 0
-        for building in obs.buildings:
-            anchor = (
-                building.cell_x if building.cell_x > 0 else building.pos_x // 1024,
-                building.cell_y if building.cell_y > 0 else building.pos_y // 1024,
-            )
-            count = len(self._naval_build_candidates(obs, anchor, 1, CHECK_FOR_WATER_RADIUS))
-            if count > best_count:
-                best_count = count
-                best_anchor = anchor
-        if best_count < NAVAL_CANDIDATE_MIN_COUNT:
+        occupied = self._occupied_building_cells(obs)
+        candidates = self._naval_build_candidates(obs, "spen", occupied)
+        if len(candidates) < NAVAL_CANDIDATE_MIN_COUNT:
             return None
-        return best_anchor
+        base_center = self._base_center(obs) or (0, 0)
+        candidates.sort(
+            key=lambda p: (
+                -self._local_water_score(p[0], p[1], 2),
+                self._cell_distance(p[0], p[1], base_center[0], base_center[1]),
+            )
+        )
+        return candidates[0]
 
     def _can_safely_build_naval_structure(self, obs: OpenRAObservation) -> bool:
         return self._best_naval_anchor(obs) is not None
