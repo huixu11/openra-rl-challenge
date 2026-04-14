@@ -40,30 +40,6 @@ python -m venv .venv
 pip install openra-rl
 
 # 5. Collect data
-python scripts/collect_bot_data.py --episodes 1 --max-minutes 5 --verbose
-```
-
-On Windows, set `$env:PYTHONUNBUFFERED="1"` before step 5 to see live output.
-
-Output is saved to `data/episodes/`. You should see kills > 0, confirming the AI opponent is active:
-
-```
-Episode 1: DONE — TIME_LIMIT(5MIN) | 18585 steps | Kills: 2u/0b | Lost: 12u/5b
-```
-
-For a full collection run:
-
-```bash
-python scripts/collect_bot_data.py --episodes 10 --max-minutes 15 --verbose
-```
-
-Each 15-minute episode produces ~20,000 steps. 10 episodes takes ~2.5 hours.
-
-### Normal AI vs Normal AI
-
-To collect data where the Python bot mimics OpenRA's built-in normal AI logic:
-
-```bash
 python scripts/collect_bot_data.py --episodes 10 --max-minutes 15 --bot normal --verbose
 ```
 
