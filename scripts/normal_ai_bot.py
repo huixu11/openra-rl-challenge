@@ -354,6 +354,8 @@ FORCE_COMMIT_MIN_SIZE = 12
 FORCE_COMMIT_GLOBAL_INTERVAL = 1200  # hard periodic wave, closer to NormalAI cadence
 STALE_TARGET_CLEAR_INTERVAL = 2400  # reduce aggressive stale clearing
 SEARCH_TARGET_STALL_TICKS = 3600
+SQUAD_STUCK_TICKS = 63
+NAVAL_FAILURE_DISABLE_TICKS = 12000
 MCV_EXPANSION_MODES = ("resource", "base", "current")
 MCV_EXPANSION_MODE_FAILURES = 2
 
@@ -399,6 +401,7 @@ class NormalAIBot:
         self._placement_backoff_snapshot: dict[str, tuple[int, int]] = {}
         self._next_placement_attempt_tick: dict[str, int] = {}
         self._naval_retry_buildable_count = -1
+        self._naval_disabled_until = -9999
 
         # Rally
         self._rally_set: set[int] = set()
@@ -429,10 +432,21 @@ class NormalAIBot:
         self._squad_last_commit_tick: dict[str, int] = {}
         self._enemy_base_pos: Optional[Tuple[int, int]] = None
         self._rush_target_pos: Optional[Tuple[int, int]] = None
+        self._rush_target_actor_id = 0
+        self._rush_target_kind = "point"
         self._stale_attack_target: Optional[Tuple[int, int]] = None
         self._stale_attack_redirects = 0
         self._search_target: Optional[Tuple[int, int]] = None
         self._search_target_started_tick = -9999
+        self._squad_last_progress_tick: dict[str, int] = {}
+        self._squad_last_progress_pos: dict[str, Tuple[int, int]] = {}
+        self._squad_last_target_point: dict[str, Tuple[int, int]] = {}
+        self._attack_commands_issued = 0
+        self._attack_move_commands_issued = 0
+        self._unit_target_events = 0
+        self._building_target_events = 0
+        self._unique_unit_targets: set[int] = set()
+        self._unique_building_targets: set[int] = set()
 
         # Repair / power
         self._repair_issued: set[int] = set()
@@ -579,18 +593,25 @@ class NormalAIBot:
 
                 if self._placement_fail_counts.get(queue_type, 0) >= MAX_FAILED_PLACEMENT_ATTEMPTS:
                     commands.append(CommandModel(action=ActionType.CANCEL_PRODUCTION, item_type=prod.item))
-                    self._placement_backoff_until[queue_type] = obs.tick + STRUCTURE_PRODUCTION_RESUME_DELAY
-                    self._placement_backoff_snapshot[queue_type] = (
-                        len(obs.buildings),
-                        sum(1 for b in obs.buildings if b.type == "fact"),
-                    )
+                    if self._canonical_building_type(prod.item) in NAVAL_STRUCTURE_TYPES:
+                        self._naval_retry_buildable_count = self._buildable_area_structure_count(obs)
+                        self._naval_disabled_until = obs.tick + NAVAL_FAILURE_DISABLE_TICKS
+                        self._cached_naval_gate_ok = False
+                        self._last_naval_gate_tick = obs.tick
+                    else:
+                        self._placement_backoff_until[queue_type] = obs.tick + STRUCTURE_PRODUCTION_RESUME_DELAY
+                        self._placement_backoff_snapshot[queue_type] = (
+                            len(obs.buildings),
+                            sum(1 for b in obs.buildings if b.type == "fact"),
+                        )
                     self._placement_fail_counts[queue_type] = 0
                     self._placement_pending.pop(queue_type, None)
                     self._next_placement_attempt_tick[queue_type] = obs.tick + PLACEMENT_ATTEMPT_INTERVAL
-                    if self._canonical_building_type(prod.item) in NAVAL_STRUCTURE_TYPES:
-                        self._naval_retry_buildable_count = self._buildable_area_structure_count(obs)
                     self._rewind_build_order_after_cancel(obs, prod.item)
-                    self._log(f"Canceling {prod.item} after repeated placement failures; backing off {queue_type} queue")
+                    if self._canonical_building_type(prod.item) in NAVAL_STRUCTURE_TYPES:
+                        self._log(f"Canceling {prod.item} after repeated placement failures; disabling naval production")
+                    else:
+                        self._log(f"Canceling {prod.item} after repeated placement failures; backing off {queue_type} queue")
                     continue
 
                 if obs.tick < self._next_placement_attempt_tick.get(queue_type, -9999):
@@ -824,9 +845,11 @@ class NormalAIBot:
             resolved_item = self._resolve_build_item(obs, item)
             if resolved_item is None or not self._can_produce(obs, resolved_item):
                 continue
+            canonical_item = self._canonical_building_type(resolved_item)
+            if canonical_item in NAVAL_STRUCTURE_TYPES:
+                continue
             if not self._structure_queue_available(obs, resolved_item):
                 continue
-            canonical_item = self._canonical_building_type(resolved_item)
             count = bldg_counts.get(canonical_item, 0)
             limit = BUILDING_LIMITS.get(canonical_item)
             if limit is not None and count >= limit:
@@ -1246,16 +1269,19 @@ class NormalAIBot:
         ):
             rush_target = self._select_rush_target(obs, rush_units)
             if rush_target is not None:
+                target_x, target_y, target_actor_id, target_kind = rush_target
                 launched = list(self._idle_ground_units)
                 existing_rush = set(self._rush_squad)
                 self._rush_squad.extend(uid for uid in launched if uid not in existing_rush)
                 self._idle_ground_units = []
                 self._last_rush_tick = obs.tick
-                self._rush_target_pos = rush_target
-                self._enemy_base_pos = rush_target
+                self._rush_target_pos = (target_x, target_y)
+                self._rush_target_actor_id = target_actor_id
+                self._rush_target_kind = target_kind
+                self._enemy_base_pos = (target_x, target_y)
                 self._clear_search_target()
                 self._reset_stale_attack_target()
-                self._log(f"Launching rush wave ({len(launched)} units) -> {rush_target}")
+                self._log(f"Launching rush wave ({len(launched)} units) -> {(target_x, target_y)}")
 
         # Launch a fresh assault wave from idle base units once enough have accumulated.
         if (
@@ -1475,12 +1501,30 @@ class NormalAIBot:
             return regroup_commands
 
         self._set_squad_state(squad_name, "commit")
-        target = self._find_attack_target(obs, leader.cell_x, leader.cell_y, squad_name=squad_name)
+        target = self._find_attack_target_info(obs, leader.cell_x, leader.cell_y, squad_name=squad_name)
         if target is None:
             fallback = self._enemy_base_pos or (self._get_map_size()[0] // 2, self._get_map_size()[1] // 2)
             tx, ty = fallback
+            target_actor_id = 0
+            target_kind = "point"
         else:
-            tx, ty = target
+            tx, ty, target_actor_id, target_kind = target
+        if (
+            not local_enemy_units
+            and not local_enemy_buildings
+            and self._squad_is_stuck(obs, squad_name, leader, (tx, ty))
+        ):
+            if squad_name == "rush" and self._rush_target_pos == (tx, ty):
+                self._rush_target_pos = None
+                self._rush_target_actor_id = 0
+                self._rush_target_kind = "point"
+            if self._enemy_base_pos == (tx, ty):
+                self._enemy_base_pos = None
+            if target_kind == "search":
+                tx, ty = self._advance_search_target(obs)
+                target_actor_id = 0
+                target_kind = "search"
+            self._reset_stale_attack_target()
         if squad_name in {"assault", "rush"}:
             self._track_stale_attack_target(obs, leader, tx, ty)
         if (force_commit or force_global) and squad_name == "assault":
@@ -1495,6 +1539,12 @@ class NormalAIBot:
                 target_y=ty,
             ))
         if commands:
+            self._record_attack_issue(
+                direct_attack=False,
+                command_count=len(commands),
+                target_actor_id=target_actor_id,
+                target_kind=target_kind,
+            )
             self._last_attack_tick = obs.tick
             self._squad_regroup_count[squad_name] = 0
             self._squad_last_commit_tick[squad_name] = obs.tick
@@ -1553,6 +1603,13 @@ class NormalAIBot:
                 actor_id=defender.actor_id,
                 target_x=threat.cell_x, target_y=threat.cell_y,
             ))
+        if commands:
+            self._record_attack_issue(
+                direct_attack=False,
+                command_count=len(commands),
+                target_actor_id=threat.actor_id,
+                target_kind="unit",
+            )
         return commands
 
     def _handle_attack(self, obs: OpenRAObservation) -> List[CommandModel]:
@@ -1595,6 +1652,56 @@ class NormalAIBot:
         )
         return commands
 
+    def _find_attack_target_info(
+        self,
+        obs: OpenRAObservation,
+        leader_x: Optional[int],
+        leader_y: Optional[int],
+        squad_name: str = "assault",
+    ) -> Tuple[int, int, int, str]:
+        if squad_name == "rush" and self._rush_target_pos is not None:
+            if self._should_clear_point_target(obs, self._rush_target_pos, leader_x, leader_y):
+                self._log(f"Clearing stale rush target {self._rush_target_pos}")
+                if self._enemy_base_pos == self._rush_target_pos:
+                    self._enemy_base_pos = None
+                self._rush_target_pos = None
+                self._rush_target_actor_id = 0
+                self._rush_target_kind = "point"
+                self._reset_stale_attack_target()
+            else:
+                self._enemy_base_pos = self._rush_target_pos
+                self._clear_search_target()
+                return (
+                    self._rush_target_pos[0],
+                    self._rush_target_pos[1],
+                    self._rush_target_actor_id,
+                    self._rush_target_kind,
+                )
+
+        priority = self._pick_priority_target(obs, None, None, local_only=False, squad_name=squad_name)
+        if priority is not None:
+            actor_id, tx, ty, _, kind = priority
+            if kind == "building":
+                self._enemy_base_pos = (tx, ty)
+            elif self._enemy_base_pos is None:
+                self._enemy_base_pos = (tx, ty)
+            self._clear_search_target()
+            self._reset_stale_attack_target()
+            return tx, ty, actor_id, kind
+        if self._enemy_base_pos and self._should_clear_enemy_base_target(obs, leader_x, leader_y):
+            self._log(f"Clearing stale enemy base target {self._enemy_base_pos}")
+            if self._rush_target_pos == self._enemy_base_pos:
+                self._rush_target_pos = None
+                self._rush_target_actor_id = 0
+                self._rush_target_kind = "point"
+            self._enemy_base_pos = None
+            self._reset_stale_attack_target()
+        if self._enemy_base_pos:
+            self._clear_search_target()
+            return self._enemy_base_pos[0], self._enemy_base_pos[1], 0, "point"
+        tx, ty = self._select_search_target(obs, leader_x, leader_y)
+        return tx, ty, 0, "search"
+
     def _find_attack_target(
         self,
         obs: OpenRAObservation,
@@ -1602,38 +1709,8 @@ class NormalAIBot:
         leader_y: Optional[int],
         squad_name: str = "assault",
     ) -> Tuple[int, int]:
-        if squad_name == "rush" and self._rush_target_pos is not None:
-            if self._should_clear_point_target(obs, self._rush_target_pos, leader_x, leader_y):
-                self._log(f"Clearing stale rush target {self._rush_target_pos}")
-                if self._enemy_base_pos == self._rush_target_pos:
-                    self._enemy_base_pos = None
-                self._rush_target_pos = None
-                self._reset_stale_attack_target()
-            else:
-                self._enemy_base_pos = self._rush_target_pos
-                self._clear_search_target()
-                return self._rush_target_pos
-
-        priority = self._pick_priority_target(obs, None, None, local_only=False, squad_name=squad_name)
-        if priority is not None:
-            _, tx, ty, _, kind = priority
-            if kind == "building":
-                self._enemy_base_pos = (tx, ty)
-            elif self._enemy_base_pos is None:
-                self._enemy_base_pos = (tx, ty)
-            self._clear_search_target()
-            self._reset_stale_attack_target()
-            return tx, ty
-        if self._enemy_base_pos and self._should_clear_enemy_base_target(obs, leader_x, leader_y):
-            self._log(f"Clearing stale enemy base target {self._enemy_base_pos}")
-            if self._rush_target_pos == self._enemy_base_pos:
-                self._rush_target_pos = None
-            self._enemy_base_pos = None
-            self._reset_stale_attack_target()
-        if self._enemy_base_pos:
-            self._clear_search_target()
-            return self._enemy_base_pos
-        return self._select_search_target(obs, leader_x, leader_y)
+        tx, ty, _, _ = self._find_attack_target_info(obs, leader_x, leader_y, squad_name=squad_name)
+        return tx, ty
 
     def _track_stale_attack_target(
         self,
@@ -1692,6 +1769,30 @@ class NormalAIBot:
             self._stale_attack_target == target
             and self._stale_attack_redirects >= STALE_TARGET_REDIRECT_LIMIT
         )
+
+    def _squad_is_stuck(
+        self,
+        obs: OpenRAObservation,
+        squad_name: str,
+        leader: UnitInfoModel,
+        target: Tuple[int, int],
+    ) -> bool:
+        current_pos = (leader.cell_x, leader.cell_y)
+        previous_pos = self._squad_last_progress_pos.get(squad_name)
+        previous_target = self._squad_last_target_point.get(squad_name)
+
+        if previous_pos != current_pos or previous_target != target:
+            self._squad_last_progress_pos[squad_name] = current_pos
+            self._squad_last_target_point[squad_name] = target
+            self._squad_last_progress_tick[squad_name] = obs.tick
+            return False
+
+        last_tick = self._squad_last_progress_tick.get(squad_name, obs.tick)
+        if obs.tick <= last_tick + SQUAD_STUCK_TICKS:
+            return False
+
+        self._squad_last_progress_tick[squad_name] = obs.tick
+        return True
 
     def _reset_stale_attack_target(self) -> None:
         self._stale_attack_target = None
@@ -1843,6 +1944,21 @@ class NormalAIBot:
         self._idle_ground_units = [uid for uid in self._idle_ground_units if uid in alive]
         self._temporary_defenders &= alive
         self._squad_regroup_count = {k: v for k, v in self._squad_regroup_count.items() if k in self._squad_states}
+        self._squad_last_progress_tick = {
+            squad_name: tick
+            for squad_name, tick in self._squad_last_progress_tick.items()
+            if squad_name in self._squad_states
+        }
+        self._squad_last_progress_pos = {
+            squad_name: pos
+            for squad_name, pos in self._squad_last_progress_pos.items()
+            if squad_name in self._squad_states
+        }
+        self._squad_last_target_point = {
+            squad_name: target
+            for squad_name, target in self._squad_last_target_point.items()
+            if squad_name in self._squad_states
+        }
         self._previous_unit_hp = {
             actor_id: hp
             for actor_id, hp in self._previous_unit_hp.items()
@@ -1909,6 +2025,8 @@ class NormalAIBot:
         ]
         if not self._rush_squad:
             self._rush_target_pos = None
+            self._rush_target_actor_id = 0
+            self._rush_target_kind = "point"
 
     def _update_damage_memory(self, obs: OpenRAObservation):
         self._recent_attack_points = [
@@ -3192,6 +3310,8 @@ class NormalAIBot:
         return candidates[0]
 
     def _can_safely_build_naval_structure(self, obs: OpenRAObservation) -> bool:
+        if obs.tick < self._naval_disabled_until:
+            return False
         if obs.tick - self._last_naval_gate_tick <= NAVAL_GATE_CACHE_TICKS:
             return self._cached_naval_gate_ok
 
@@ -3810,7 +3930,7 @@ class NormalAIBot:
         self,
         obs: OpenRAObservation,
         rush_units: list[UnitInfoModel],
-    ) -> Optional[Tuple[int, int]]:
+    ) -> Optional[Tuple[int, int, int, str]]:
         attackable_units = [
             unit for unit in rush_units
             if unit.can_attack and unit.type not in AIRCRAFT_TYPES | SHIP_TYPES
@@ -3845,7 +3965,9 @@ class NormalAIBot:
                 continue
 
             target = random.choice(defenders) if defenders else conyard
-            return self._actor_cell(target)
+            target_kind = "unit" if isinstance(target, UnitInfoModel) else "building"
+            tx, ty = self._actor_cell(target)
+            return tx, ty, target.actor_id, target_kind
 
         return None
 
@@ -4000,7 +4122,7 @@ class NormalAIBot:
         squad_units: list[UnitInfoModel],
         target: Tuple[int, int, int, str, str],
     ) -> List[CommandModel]:
-        target_actor_id, tx, ty, _, _ = target
+        target_actor_id, tx, ty, _, target_kind = target
         commands = []
         for u in squad_units:
             if not u.can_attack:
@@ -4012,7 +4134,53 @@ class NormalAIBot:
                 target_x=tx,
                 target_y=ty,
             ))
+        if commands:
+            self._record_attack_issue(
+                direct_attack=True,
+                command_count=len(commands),
+                target_actor_id=target_actor_id,
+                target_kind=target_kind,
+            )
         return commands
+
+    def _record_attack_issue(
+        self,
+        direct_attack: bool,
+        command_count: int,
+        target_actor_id: int = 0,
+        target_kind: str = "point",
+    ) -> None:
+        if command_count <= 0:
+            return
+
+        if direct_attack:
+            self._attack_commands_issued += command_count
+        else:
+            self._attack_move_commands_issued += command_count
+
+        if target_actor_id <= 0:
+            return
+
+        if target_kind == "unit":
+            self._unit_target_events += 1
+            self._unique_unit_targets.add(target_actor_id)
+        elif target_kind == "building":
+            self._building_target_events += 1
+            self._unique_building_targets.add(target_actor_id)
+
+    def get_attack_stats(self, obs: Optional[OpenRAObservation] = None) -> dict[str, int]:
+        stats = {
+            "attack_commands": self._attack_commands_issued,
+            "attack_move_commands": self._attack_move_commands_issued,
+            "unit_target_events": self._unit_target_events,
+            "building_target_events": self._building_target_events,
+            "unique_unit_targets": len(self._unique_unit_targets),
+            "unique_building_targets": len(self._unique_building_targets),
+        }
+        if obs is not None:
+            stats["units_killed"] = obs.military.units_killed
+            stats["buildings_killed"] = obs.military.buildings_killed
+        return stats
 
     def _retreat_squad_commands(
         self,

@@ -34,6 +34,7 @@ Notes:
 import argparse
 import asyncio
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -256,6 +257,28 @@ def available_credits(obs: OpenRAObservation) -> int:
     return obs.economy.cash + obs.economy.ore
 
 
+def copy_replay_artifact(replay_info: dict, output_dir: Path, episode_id: int) -> dict:
+    """Copy the replay locally when the server returned a readable file path."""
+    if not replay_info:
+        return {}
+
+    replay_path = replay_info.get("path", "")
+    if not replay_path:
+        return replay_info
+
+    source = Path(replay_path)
+    if not source.is_file():
+        return replay_info
+
+    destination = output_dir / f"episode_{episode_id:03d}{source.suffix}"
+    if source.resolve() != destination.resolve():
+        shutil.copy2(source, destination)
+
+    enriched = dict(replay_info)
+    enriched["local_copy"] = str(destination)
+    return enriched
+
+
 def infer_outcome(
     final_obs: OpenRAObservation,
     eliminated_since_step: int | None,
@@ -280,7 +303,7 @@ async def collect_episode(
     map_name: str = "singles.oramap",
     verbose: bool = False,
     bot_type: str = "scripted",
-) -> list[dict]:
+) -> dict:
     """Play one full game and record the trajectory.
 
     Stops when any of these conditions is met (in order):
@@ -296,15 +319,31 @@ async def collect_episode(
     else:
         bot = PeriodicAttackBot(verbose=False)
     trajectory = []
+    replay_info = {}
+    error = ""
     max_seconds = max_minutes * 60.0
     episode_start = time.time()
+    step = 0
+    eliminated_since_step = None
+    result = None
+    obs = None
 
     async with OpenRAEnv(base_url=env_url, message_timeout_s=300.0) as env:
         if verbose:
             print(f"  Episode {episode_id}: Resetting environment (map={map_name})...")
 
-        result = await env.reset(map_name=map_name)
-        obs = result.observation
+        try:
+            result = await env.reset(map_name=map_name)
+            obs = result.observation
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            if verbose:
+                print(f"  Episode {episode_id}: RESET ERROR | {error}")
+            try:
+                replay_info = await env.call_tool("get_replay_path")
+            except Exception:
+                replay_info = {}
+            return {"trajectory": trajectory, "replay": replay_info, "error": error}
 
         # Let the bot see the reset observation so _get_map_size can initialize
         # (the correct playable-area dimensions will be refined on later steps)
@@ -343,22 +382,28 @@ async def collect_episode(
             else:
                 eliminated_since_step = None
 
-            # Expert decides
-            obs_before = result.observation
-            action = bot.decide(obs_before)
+            try:
+                # Expert decides
+                obs_before = result.observation
+                action = bot.decide(obs_before)
 
-            # Execute and get reward for THIS action
-            result = await env.step(action)
-            step += 1
+                # Execute and get reward for THIS action
+                result = await env.step(action)
+                step += 1
 
-            # Record (s, a, r, done) where r is the reward from taking a in s
-            trajectory.append({
-                "step": step - 1,
-                "observation": serialize_obs(obs_before),
-                "action": serialize_action(action),
-                "reward": result.reward or 0.0,
-                "done": result.done,
-            })
+                # Record (s, a, r, done) where r is the reward from taking a in s
+                trajectory.append({
+                    "step": step - 1,
+                    "observation": serialize_obs(obs_before),
+                    "action": serialize_action(action),
+                    "reward": result.reward or 0.0,
+                    "done": result.done,
+                })
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                if verbose:
+                    print(f"  Episode {episode_id}: STEP ERROR | {error}")
+                break
 
             if verbose and step % 200 == 0:
                 eco = result.observation.economy
@@ -366,38 +411,66 @@ async def collect_episode(
                 n_buildings = len(result.observation.buildings)
                 elapsed_min = (time.time() - episode_start) / 60.0
                 credits = available_credits(result.observation)
+                attack_stats = bot.get_attack_stats(result.observation) if hasattr(bot, "get_attack_stats") else None
+                attack_info = ""
+                if attack_stats is not None:
+                    attack_info = (
+                        f" | Targeted:{attack_stats['unique_unit_targets']}u/{attack_stats['unique_building_targets']}b"
+                        f" | Kills:{attack_stats['units_killed']}u/{attack_stats['buildings_killed']}b"
+                    )
                 print(
                     f"  Episode {episode_id}: Step {step:4d} | "
                     f"Tick {result.observation.tick:5d} | "
                     f"Cash:${eco.cash:5d} Ore:{eco.ore:5d} Tot:${credits:5d} | "
                     f"Units:{n_units} Bldgs:{n_buildings} | "
                     f"{bot.phase} | {elapsed_min:.1f}min"
+                    f"{attack_info}"
                 )
 
-        # Record the final observation (no action taken, so reward=0)
-        final_obs = result.observation
-        trajectory.append({
-            "step": step,
-            "observation": serialize_obs(final_obs),
-            "action": {"commands": [{"action": "no_op"}]},
-            "reward": 0.0,
-            "done": True,
-        })
+        if result is not None and not result.done:
+            try:
+                await env.call_tool("surrender")
+            except Exception:
+                pass
 
-        if verbose:
+        try:
+            replay_info = await env.call_tool("get_replay_path")
+        except Exception as replay_exc:
+            replay_info = {"error": str(replay_exc)}
+
+        # Record the final observation (no action taken, so reward=0)
+        final_obs = result.observation if result is not None else obs
+        if final_obs is not None:
+            trajectory.append({
+                "step": step,
+                "observation": serialize_obs(final_obs),
+                "action": {"commands": [{"action": "no_op"}]},
+                "reward": 0.0,
+                "done": True,
+            })
+
+        if verbose and final_obs is not None:
             mil = final_obs.military
             elapsed_total_s = time.time() - episode_start
             outcome = infer_outcome(final_obs, eliminated_since_step, elapsed_total_s, max_minutes)
             elapsed_total = elapsed_total_s / 60.0
+            attack_stats = bot.get_attack_stats(final_obs) if hasattr(bot, "get_attack_stats") else None
+            attack_info = ""
+            if attack_stats is not None:
+                attack_info = (
+                    f" | Targeted: {attack_stats['unique_unit_targets']}u/{attack_stats['unique_building_targets']}b"
+                    f" | Orders: {attack_stats['attack_commands']} ATTACK, {attack_stats['attack_move_commands']} AMOVE"
+                )
             print(
                 f"  Episode {episode_id}: DONE — {outcome.upper()} | "
                 f"{step} steps | Tick {final_obs.tick} | "
                 f"Real time: {elapsed_total:.1f}min | "
                 f"Kills: {mil.units_killed}u/{mil.buildings_killed}b | "
                 f"Lost: {mil.units_lost}u/{mil.buildings_lost}b"
+                f"{attack_info}"
             )
 
-    return trajectory
+    return {"trajectory": trajectory, "replay": replay_info, "error": error}
 
 
 async def collect_all(
@@ -422,7 +495,7 @@ async def collect_all(
 
         t0 = time.time()
         try:
-            trajectory = await collect_episode(
+            episode_data = await collect_episode(
                 env_url=env_url,
                 episode_id=i,
                 max_steps=max_steps,
@@ -436,6 +509,9 @@ async def collect_all(
             continue
 
         elapsed = time.time() - t0
+        trajectory = episode_data.get("trajectory", [])
+        replay_info = copy_replay_artifact(episode_data.get("replay", {}), output_dir, i)
+        episode_error = episode_data.get("error", "")
 
         # Save trajectory
         filename = output_dir / f"episode_{i:03d}.json"
@@ -443,7 +519,7 @@ async def collect_all(
             json.dump(trajectory, f, indent=None)  # compact JSON
 
         # Compute summary
-        final = trajectory[-1]["observation"]
+        final = trajectory[-1]["observation"] if trajectory else {}
         mil = final.get("military", {})
         final_units = len(final.get("units", []))
         final_buildings = len(final.get("buildings", []))
@@ -467,6 +543,9 @@ async def collect_all(
             "final_units": final_units,
             "elapsed_s": round(elapsed, 1),
             "file": str(filename),
+            "replay_path": replay_info.get("path", ""),
+            "replay_local_copy": replay_info.get("local_copy", ""),
+            "error": episode_error,
         }
         summaries.append(summary)
 
@@ -475,6 +554,12 @@ async def collect_all(
             f"  Saved {filename.name} ({file_size_mb:.1f} MB, "
             f"{len(trajectory)} steps, {elapsed:.0f}s)"
         )
+        if replay_info.get("local_copy"):
+            print(f"  Replay copied to {Path(replay_info['local_copy']).name}")
+        elif replay_info.get("path"):
+            print(f"  Replay available at {replay_info['path']}")
+        if episode_error:
+            print(f"  Episode {i} completed with error: {episode_error}")
 
     # Save collection summary
     summary_file = output_dir / "collection_summary.json"
