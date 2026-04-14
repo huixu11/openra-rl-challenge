@@ -1263,6 +1263,11 @@ class NormalAIBot:
             self._set_squad_state(squad_name, "assemble")
             return commands
 
+        if squad_name not in self._squad_regroup_count:
+            self._squad_regroup_count[squad_name] = 0
+        if squad_name not in self._squad_last_commit_tick:
+            self._squad_last_commit_tick[squad_name] = -9999
+
         state = self._current_squad_state(obs, squad_name)
         leader = self._select_squad_leader(squad_units)
         local_enemy_units = self._visible_enemy_units_near(obs, leader.cell_x, leader.cell_y, LOCAL_FIGHT_RADIUS)
@@ -1304,6 +1309,7 @@ class NormalAIBot:
             if retreat_commands:
                 return retreat_commands
             self._set_squad_state(squad_name, "recover", obs.tick + SQUAD_RECOVER_HOLD_TICKS)
+            self._squad_regroup_count[squad_name] = 0
 
         if state == "recover" and not (local_enemy_units or local_enemy_buildings):
             return self._assemble_squad_commands(obs, squad_name, squad_units)
@@ -1321,6 +1327,7 @@ class NormalAIBot:
             self._set_squad_state(squad_name, "assemble")
             if squad_name == "assault":
                 self._assault_threshold = self._roll_assault_threshold()
+            self._squad_regroup_count[squad_name] = 0
             return self._assemble_squad_commands(obs, squad_name, squad_units)
 
         if squad_name == "naval" and not (
@@ -1329,16 +1336,34 @@ class NormalAIBot:
             self._set_squad_state(squad_name, "assemble")
             return commands
 
+        force_commit = False
+        if squad_name in {"assault", "rush"}:
+            regroup_attempts = self._squad_regroup_count.get(squad_name, 0)
+            last_commit_tick = self._squad_last_commit_tick.get(squad_name, -9999)
+            if (
+                regroup_attempts >= FORCE_COMMIT_REGROUPS
+                and len(squad_units) >= FORCE_COMMIT_UNIT_THRESHOLD
+                and not local_enemy_units
+                and not local_enemy_buildings
+                and obs.tick - last_commit_tick >= FORCE_COMMIT_COOLDOWN
+                and not self._base_under_pressure(obs)
+            ):
+                force_commit = True
+
         regroup_commands = self._regroup_squad_commands(squad_units, leader)
         if regroup_commands:
             self._set_squad_state(squad_name, "regroup")
+            self._squad_regroup_count[squad_name] = self._squad_regroup_count.get(squad_name, 0) + 1
             return regroup_commands
 
         self._set_squad_state(squad_name, "commit")
         tx, ty = self._find_attack_target(obs, leader.cell_x, leader.cell_y, squad_name=squad_name)
         if squad_name in {"assault", "rush"}:
             self._track_stale_attack_target(obs, leader, tx, ty)
-        attackers = self._attack_wave_units(obs, squad_units) if squad_name == "assault" else squad_units
+        if force_commit and squad_name == "assault":
+            attackers = squad_units
+        else:
+            attackers = self._attack_wave_units(obs, squad_units) if squad_name == "assault" else squad_units
         for unit in attackers:
             commands.append(CommandModel(
                 action=ActionType.ATTACK_MOVE,
@@ -1348,6 +1373,9 @@ class NormalAIBot:
             ))
         if commands and rush:
             self._last_rush_tick = obs.tick
+        if commands:
+            self._squad_regroup_count[squad_name] = 0
+            self._squad_last_commit_tick[squad_name] = obs.tick
         return commands
 
     def _handle_defense(self, obs: OpenRAObservation) -> List[CommandModel]:
