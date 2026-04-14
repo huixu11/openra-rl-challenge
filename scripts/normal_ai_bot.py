@@ -274,6 +274,10 @@ UNIT_PRODUCTION_DELAYS: dict[str, int] = {
     "heli": 140,
     "mh60": 140,
 }
+FOG_CHANNEL = 4  # spatial-map channel: 0=hidden, 0.5=explored, 1=visible
+FRONTIER_REFRESH_TICKS = 650
+LAST_SEEN_ENEMY_TTL_TICKS = 6000
+LAST_SEEN_BASE_TTL_TICKS = 18000
 QUEUE_IDLE_BASE_CAPS: dict[str, int] = {
     "Infantry": 14,
     "Vehicle": 9,
@@ -431,6 +435,11 @@ class NormalAIBot:
         self._squad_regroup_count: dict[str, int] = {}
         self._squad_last_commit_tick: dict[str, int] = {}
         self._enemy_base_pos: Optional[Tuple[int, int]] = None
+        # Bridge only exposes currently visible enemies; keep a short-lived memory.
+        self._last_seen_enemy_pos: Optional[Tuple[int, int]] = None
+        self._last_seen_enemy_tick: int = -9999
+        self._last_seen_base_pos: Optional[Tuple[int, int]] = None
+        self._last_seen_base_tick: int = -9999
         self._rush_target_pos: Optional[Tuple[int, int]] = None
         self._rush_target_actor_id = 0
         self._rush_target_kind = "point"
@@ -481,6 +490,7 @@ class NormalAIBot:
         self._cached_map_size: Optional[Tuple[int, int]] = None
         self._candidate_targets: list[Tuple[int, int]] = []
         self._target_index = 0
+        self._frontier_cache_tick = -9999
         self._recent_attack_points: list[tuple[int, int, int]] = []
         self._previous_building_hp: dict[int, float] = {}
         self._previous_unit_hp: dict[int, float] = {}
@@ -498,6 +508,7 @@ class NormalAIBot:
         commands: List[CommandModel] = []
         self._update_map_size(obs)
         self._update_spatial_analysis(obs)
+        self._update_enemy_memory(obs)
         self._update_phase(obs)
         self._cleanup_dead(obs)
         self._update_damage_memory(obs)
@@ -523,6 +534,33 @@ class NormalAIBot:
             commands.append(CommandModel(action=ActionType.NO_OP))
 
         return OpenRAAction(commands=commands)
+
+    def _update_enemy_memory(self, obs: OpenRAObservation) -> None:
+        """Update last-seen enemy memory from currently visible enemies/buildings."""
+        if not (obs.visible_enemies or obs.visible_enemy_buildings):
+            return
+
+        best = self._pick_priority_target(obs, None, None, local_only=False, squad_name="assault")
+        if best is None:
+            # Fallback to any visible contact
+            if obs.visible_enemy_buildings:
+                b = obs.visible_enemy_buildings[0]
+                self._last_seen_enemy_pos = (b.cell_x, b.cell_y)
+                self._last_seen_enemy_tick = obs.tick
+                self._last_seen_base_pos = (b.cell_x, b.cell_y)
+                self._last_seen_base_tick = obs.tick
+            elif obs.visible_enemies:
+                e = obs.visible_enemies[0]
+                self._last_seen_enemy_pos = (e.cell_x, e.cell_y)
+                self._last_seen_enemy_tick = obs.tick
+            return
+
+        _, tx, ty, _, kind = best
+        self._last_seen_enemy_pos = (tx, ty)
+        self._last_seen_enemy_tick = obs.tick
+        if kind == "building":
+            self._last_seen_base_pos = (tx, ty)
+            self._last_seen_base_tick = obs.tick
 
     # ── Phase ─────────────────────────────────────────────────────
 
@@ -1699,6 +1737,14 @@ class NormalAIBot:
         if self._enemy_base_pos:
             self._clear_search_target()
             return self._enemy_base_pos[0], self._enemy_base_pos[1], 0, "point"
+
+        # If we don't have a persistent base target, prefer last-seen memory before blind exploration.
+        if self._last_seen_base_pos is not None and obs.tick - self._last_seen_base_tick <= LAST_SEEN_BASE_TTL_TICKS:
+            self._clear_search_target()
+            return self._last_seen_base_pos[0], self._last_seen_base_pos[1], 0, "point"
+        if self._last_seen_enemy_pos is not None and obs.tick - self._last_seen_enemy_tick <= LAST_SEEN_ENEMY_TTL_TICKS:
+            self._clear_search_target()
+            return self._last_seen_enemy_pos[0], self._last_seen_enemy_pos[1], 0, "point"
         tx, ty = self._select_search_target(obs, leader_x, leader_y)
         return tx, ty, 0, "search"
 
@@ -1763,6 +1809,10 @@ class NormalAIBot:
             and leader_y is not None
             and self._cell_distance(leader_x, leader_y, tx, ty) <= STALE_TARGET_REACHED_RADIUS
         ):
+            # Only clear after we have actually explored the area around the point.
+            # Otherwise we can drop targets prematurely and re-sweep the same zones.
+            if self._spatial_raw:
+                return self._area_is_explored(tx, ty, radius=5, threshold=0.5)
             return True
 
         return (
@@ -1836,22 +1886,94 @@ class NormalAIBot:
 
         return self._search_target
 
+    def _spatial_fog(self, x: int, y: int) -> float:
+        return self._spatial_value(x, y, FOG_CHANNEL, 0.0)
+
+    def _area_is_explored(self, x: int, y: int, radius: int = 5, threshold: float = 0.5) -> bool:
+        """True if any cell near (x,y) is explored/visible (fog>=0.5)."""
+        if not self._spatial_raw:
+            return False
+        w, h = self._get_map_size()
+        x0 = max(0, x - radius)
+        y0 = max(0, y - radius)
+        x1 = min(w - 1, x + radius)
+        y1 = min(h - 1, y + radius)
+        for yy in range(y0, y1 + 1):
+            for xx in range(x0, x1 + 1):
+                if self._spatial_fog(xx, yy) >= threshold:
+                    return True
+        return False
+
     def _search_grid(self, obs: OpenRAObservation) -> list[Tuple[int, int]]:
+        """Exploration candidates.
+
+        Prefer frontier/unexplored regions when spatial fog exists (channel 4).
+        Otherwise fall back to a coarse far-from-base grid.
+        """
         w, h = self._get_map_size()
         cy = self._find_building(obs, "fact")
         if not cy:
             return [(w // 2, h // 2)]
         bx = cy.cell_x if cy.cell_x > 0 else cy.pos_x // 1024
         by = cy.cell_y if cy.cell_y > 0 else cy.pos_y // 1024
+
+        if self._spatial_raw and obs.tick - self._frontier_cache_tick >= FRONTIER_REFRESH_TICKS:
+            self._frontier_cache_tick = obs.tick
+            block = 8
+            gx_max = max(1, w // block)
+            gy_max = max(1, h // block)
+            scored: list[tuple[float, tuple[int, int]]] = []
+            for gx in range(gx_max):
+                for gy in range(gy_max):
+                    cx = min(w - 1, gx * block + block // 2)
+                    cyy = min(h - 1, gy * block + block // 2)
+                    if not self._cell_is_passable(cx, cyy):
+                        continue
+
+                    unseen = 0
+                    frontier = 0
+                    samples = 0
+                    for sx in (0, block // 2, block - 1):
+                        for sy in (0, block // 2, block - 1):
+                            x = gx * block + sx
+                            y = gy * block + sy
+                            if x < 0 or y < 0 or x >= w or y >= h:
+                                continue
+                            samples += 1
+                            fog = self._spatial_fog(x, y)
+                            if fog < 0.25:
+                                unseen += 1
+                                # frontier if adjacent to explored/visible
+                                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                                    nx, ny = x + dx, y + dy
+                                    if 0 <= nx < w and 0 <= ny < h and self._spatial_fog(nx, ny) >= 0.5:
+                                        frontier += 1
+                                        break
+
+                    if samples <= 0:
+                        continue
+                    unseen_frac = unseen / samples
+                    frontier_frac = frontier / samples
+                    d2 = (cx - bx) * (cx - bx) + (cyy - by) * (cyy - by)
+                    score = unseen_frac * 3.0 + frontier_frac * 4.0 + (d2 ** 0.5) * 0.01
+                    if d2 < 20 * 20:
+                        score -= 1.5
+                    scored.append((score, (cx, cyy)))
+
+            scored.sort(key=lambda t: t[0], reverse=True)
+            candidates = [p for _, p in scored[:40]]
+            if candidates:
+                return candidates
+
         n = 3
         cw, ch = max(1, w // n), max(1, h // n)
         centers = [(cw * gx + cw // 2, ch * gy + ch // 2)
-                    for gx in range(n) for gy in range(n)]
+                   for gx in range(n) for gy in range(n)]
         min_d2 = (min(w, h) // n) ** 2
-        far = [p for p in centers if (p[0]-bx)**2 + (p[1]-by)**2 > min_d2]
+        far = [p for p in centers if (p[0] - bx) ** 2 + (p[1] - by) ** 2 > min_d2]
         if not far:
             far = [(w // 2, h // 2)]
-        far.sort(key=lambda p: (p[0]-bx)**2 + (p[1]-by)**2, reverse=True)
+        far.sort(key=lambda p: (p[0] - bx) ** 2 + (p[1] - by) ** 2, reverse=True)
         return far
 
     # ── Repairs ───────────────────────────────────────────────────

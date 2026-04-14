@@ -279,6 +279,22 @@ def copy_replay_artifact(replay_info: dict, output_dir: Path, episode_id: int) -
     return enriched
 
 
+def write_json_array_stream(path: Path, items: list[dict]) -> None:
+    """Write a JSON array incrementally to avoid huge peak memory/slow dumps.
+
+    This matters for long episodes where the trajectory can be >1GB.
+    """
+    with open(path, "w") as f:
+        f.write("[")
+        for i, item in enumerate(items):
+            if i:
+                f.write(",")
+            json.dump(item, f, separators=(",", ":"))
+            if i and i % 2000 == 0:
+                f.flush()
+        f.write("]")
+
+
 def infer_outcome(
     final_obs: OpenRAObservation,
     eliminated_since_step: int | None,
@@ -356,85 +372,90 @@ async def collect_episode(
 
         step = 0
         eliminated_since_step = None
-        while not result.done and step < max_steps:
-            # Stop if wall-clock time limit exceeded
-            elapsed_so_far = time.time() - episode_start
-            if elapsed_so_far >= max_seconds:
-                if verbose:
-                    print(
-                        f"  Episode {episode_id}: Time limit reached "
-                        f"({elapsed_so_far/60:.1f} min), stopping."
-                    )
-                break
-
-            # Stop early if we've lost everything (0 units + 0 buildings)
-            obs_now = result.observation
-            if not obs_now.units and not obs_now.buildings and step > 100:
-                if eliminated_since_step is None:
-                    eliminated_since_step = step
-                elif step - eliminated_since_step >= 200:
+        try:
+            while not result.done and step < max_steps:
+                # Stop if wall-clock time limit exceeded
+                elapsed_so_far = time.time() - episode_start
+                if elapsed_so_far >= max_seconds:
                     if verbose:
                         print(
-                            f"  Episode {episode_id}: Eliminated "
-                            f"(0 units/buildings for 200 steps), stopping."
+                            f"  Episode {episode_id}: Time limit reached "
+                            f"({elapsed_so_far/60:.1f} min), stopping."
                         )
                     break
-            else:
-                eliminated_since_step = None
 
-            try:
-                # Expert decides
-                obs_before = result.observation
-                action = bot.decide(obs_before)
+                # Stop early if we've lost everything (0 units + 0 buildings)
+                obs_now = result.observation
+                if not obs_now.units and not obs_now.buildings and step > 100:
+                    if eliminated_since_step is None:
+                        eliminated_since_step = step
+                    elif step - eliminated_since_step >= 200:
+                        if verbose:
+                            print(
+                                f"  Episode {episode_id}: Eliminated "
+                                f"(0 units/buildings for 200 steps), stopping."
+                            )
+                        break
+                else:
+                    eliminated_since_step = None
 
-                # Execute and get reward for THIS action
-                result = await env.step(action)
-                step += 1
+                try:
+                    # Expert decides
+                    obs_before = result.observation
+                    action = bot.decide(obs_before)
 
-                # Record (s, a, r, done) where r is the reward from taking a in s
-                trajectory.append({
-                    "step": step - 1,
-                    "observation": serialize_obs(obs_before),
-                    "action": serialize_action(action),
-                    "reward": result.reward or 0.0,
-                    "done": result.done,
-                })
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-                if verbose:
-                    print(f"  Episode {episode_id}: STEP ERROR | {error}")
-                break
+                    # Execute and get reward for THIS action
+                    result = await env.step(action)
+                    step += 1
 
-            if verbose and step % 200 == 0:
-                eco = result.observation.economy
-                n_units = len(result.observation.units)
-                n_buildings = len(result.observation.buildings)
-                elapsed_min = (time.time() - episode_start) / 60.0
-                credits = available_credits(result.observation)
-                attack_stats = bot.get_attack_stats(result.observation) if hasattr(bot, "get_attack_stats") else None
-                attack_info = ""
-                if attack_stats is not None:
-                    attack_info = (
-                        f" | Targeted:{attack_stats['unique_unit_targets']}u/{attack_stats['unique_building_targets']}b"
-                        f" | Kills:{attack_stats['units_killed']}u/{attack_stats['buildings_killed']}b"
+                    # Record (s, a, r, done) where r is the reward from taking a in s
+                    trajectory.append({
+                        "step": step - 1,
+                        "observation": serialize_obs(obs_before),
+                        "action": serialize_action(action),
+                        "reward": result.reward or 0.0,
+                        "done": result.done,
+                    })
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    if verbose:
+                        print(f"  Episode {episode_id}: STEP ERROR | {error}")
+                    break
+
+                if verbose and step % 200 == 0:
+                    eco = result.observation.economy
+                    n_units = len(result.observation.units)
+                    n_buildings = len(result.observation.buildings)
+                    elapsed_min = (time.time() - episode_start) / 60.0
+                    credits = available_credits(result.observation)
+                    attack_stats = bot.get_attack_stats(result.observation) if hasattr(bot, "get_attack_stats") else None
+                    attack_info = ""
+                    if attack_stats is not None:
+                        attack_info = (
+                            f" | Targeted:{attack_stats['unique_unit_targets']}u/{attack_stats['unique_building_targets']}b"
+                            f" | Kills:{attack_stats['units_killed']}u/{attack_stats['buildings_killed']}b"
+                        )
+                    print(
+                        f"  Episode {episode_id}: Step {step:4d} | "
+                        f"Tick {result.observation.tick:5d} | "
+                        f"Cash:${eco.cash:5d} Ore:{eco.ore:5d} Tot:${credits:5d} | "
+                        f"Units:{n_units} Bldgs:{n_buildings} | "
+                        f"{bot.phase} | {elapsed_min:.1f}min"
+                        f"{attack_info}"
                     )
-                print(
-                    f"  Episode {episode_id}: Step {step:4d} | "
-                    f"Tick {result.observation.tick:5d} | "
-                    f"Cash:${eco.cash:5d} Ore:{eco.ore:5d} Tot:${credits:5d} | "
-                    f"Units:{n_units} Bldgs:{n_buildings} | "
-                    f"{bot.phase} | {elapsed_min:.1f}min"
-                    f"{attack_info}"
-                )
 
-        if result is not None and not result.done:
-            try:
-                await env.call_tool("surrender")
-            except Exception:
-                pass
+        except KeyboardInterrupt:
+            error = "KeyboardInterrupt"
+        finally:
+            # If we stopped due to time/step limits, surrender to force a game-over so a replay is written.
+            if result is not None and not result.done:
+                try:
+                    await asyncio.wait_for(env.call_tool("surrender"), timeout=30.0)
+                except Exception:
+                    pass
 
         try:
-            replay_info = await env.call_tool("get_replay_path")
+            replay_info = await asyncio.wait_for(env.call_tool("get_replay_path"), timeout=10.0)
         except Exception as replay_exc:
             replay_info = {"error": str(replay_exc)}
 
@@ -513,10 +534,9 @@ async def collect_all(
         replay_info = copy_replay_artifact(episode_data.get("replay", {}), output_dir, i)
         episode_error = episode_data.get("error", "")
 
-        # Save trajectory
+        # Save trajectory (streaming write helps for huge episodes)
         filename = output_dir / f"episode_{i:03d}.json"
-        with open(filename, "w") as f:
-            json.dump(trajectory, f, indent=None)  # compact JSON
+        write_json_array_stream(filename, trajectory)
 
         # Compute summary
         final = trajectory[-1]["observation"] if trajectory else {}
