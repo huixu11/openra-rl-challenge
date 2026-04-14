@@ -1583,6 +1583,7 @@ class NormalAIBot:
                 target_actor_id=target_actor_id,
                 target_kind=target_kind,
             )
+            self._log(f"{squad_name.capitalize()} squad: {len(commands)} units attacking {target_kind} at ({tx}, {ty})")
             self._last_attack_tick = obs.tick
             self._squad_regroup_count[squad_name] = 0
             self._squad_last_commit_tick[squad_name] = obs.tick
@@ -1927,7 +1928,7 @@ class NormalAIBot:
                 for gy in range(gy_max):
                     cx = min(w - 1, gx * block + block // 2)
                     cyy = min(h - 1, gy * block + block // 2)
-                    if not self._cell_is_passable(cx, cyy):
+                    if not self._is_passable_cell(cx, cyy):
                         continue
 
                     unseen = 0
