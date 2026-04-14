@@ -385,6 +385,8 @@ class NormalAIBot:
             "naval": "assemble",
         }
         self._squad_state_until: dict[str, int] = {}
+        self._squad_regroup_count: dict[str, int] = {}
+        self._squad_last_commit_tick: dict[str, int] = {}
         self._enemy_base_pos: Optional[Tuple[int, int]] = None
         self._stale_attack_target: Optional[Tuple[int, int]] = None
         self._stale_attack_redirects = 0
@@ -1611,6 +1613,7 @@ class NormalAIBot:
         self._air_squad = [uid for uid in self._air_squad if uid in alive]
         self._naval_squad = [uid for uid in self._naval_squad if uid in alive]
         self._temporary_defenders &= alive
+        self._squad_regroup_count = {k: v for k, v in self._squad_regroup_count.items() if k in self._squad_states}
         self._mcv_targets = {
             actor_id: target
             for actor_id, target in self._mcv_targets.items()
