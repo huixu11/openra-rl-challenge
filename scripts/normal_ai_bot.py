@@ -81,6 +81,7 @@ UNIT_QUEUE_ORDER: tuple[tuple[str, set[str]], ...] = (
 
 STRUCTURE_QUEUE_TYPES = {"Building", "Defense"}
 DEFENSE_STRUCTURE_TYPES = {"pbox", "hbox", "gun", "ftur", "tsla", "agun", "sam", "gap", "mslo"}
+ATTACKING_BUILDING_TYPES = {"pbox", "hbox", "gun", "ftur", "tsla", "agun", "sam"}
 NAVAL_STRUCTURE_TYPES = {"spen", "syrd"}
 ENEMY_FACING_STRUCTURE_TYPES = {"pbox", "hbox", "gun", "ftur", "tsla", "agun", "sam"}
 NO_BUILDABLE_AREA_TYPES = NAVAL_STRUCTURE_TYPES | {"silo", "kenn"}
@@ -297,10 +298,12 @@ PROTECT_UNIT_SCAN_RADIUS = 15
 PROTECTION_SCAN_RADIUS = 12
 PROTECTION_RESPONSE_COOLDOWN = 30
 REPAIR_ALL_BUILDINGS_COOLDOWN = 107
+REPAIR_REACTIVE_HP_THRESHOLD = 0.67
 POWER_TOGGLE_INTERVAL = 150
 ATTACK_SCAN_RADIUS = 12
 REGROUP_RADIUS = 14
 LOCAL_FIGHT_RADIUS = 12
+RUSH_ATTACK_SCAN_RADIUS = 15
 RETREAT_HEALTH_THRESHOLD = 0.42
 MINIMUM_CONSTRUCTION_YARD_COUNT = 2
 BUILD_ADDITIONAL_MCV_CASH_AMOUNT = 5000
@@ -322,6 +325,9 @@ HARVESTER_LOW_EFFECT_TIMEOUT = 500
 HARVESTER_NO_RESOURCE_COOLDOWN = 300
 HARVESTER_PROGRESS_MOVE_THRESHOLD = 2
 HARVESTER_LOCAL_RESOURCE_MIN = 0.5
+BASE_ATTACK_MEMORY_TICKS = 150
+BASE_EMERGENCY_VISIBILITY_RADIUS = 5
+ATTACK_POINT_MERGE_RADIUS = 4
 POST_CONTACT_WINDOW = 2400
 RECOVERY_DURATION = 2600
 RECOVERY_TRIGGER_PEAK = 24
@@ -348,6 +354,30 @@ FORCE_COMMIT_MIN_SIZE = 12
 FORCE_COMMIT_GLOBAL_INTERVAL = 1200  # hard periodic wave, closer to NormalAI cadence
 STALE_TARGET_CLEAR_INTERVAL = 2400  # reduce aggressive stale clearing
 SEARCH_TARGET_STALL_TICKS = 3600
+MCV_EXPANSION_MODES = ("resource", "base", "current")
+MCV_EXPANSION_MODE_FAILURES = 2
+
+FUZZY_ANY_HEALTH = ("NearDead", "Injured", "Normal")
+FUZZY_ANY_POWER = ("Weak", "Equal", "Strong")
+FUZZY_ANY_SPEED = ("Slow", "Equal", "Fast")
+FUZZY_DEFAULT_RULES = (
+    (("Normal",), FUZZY_ANY_HEALTH, FUZZY_ANY_POWER, FUZZY_ANY_SPEED, "Attack"),
+    (("Injured",), ("NearDead",), FUZZY_ANY_POWER, FUZZY_ANY_SPEED, "Attack"),
+    (("Injured",), ("Injured", "Normal"), ("Equal", "Strong"), FUZZY_ANY_SPEED, "Attack"),
+    (("Injured",), ("Injured", "Normal"), ("Weak",), ("Slow",), "Attack"),
+    (("Injured",), ("Injured", "Normal"), ("Weak",), ("Equal", "Fast"), "Flee"),
+    (("Injured",), FUZZY_ANY_HEALTH, FUZZY_ANY_POWER, ("Slow",), "Attack"),
+    (("NearDead",), ("NearDead", "Injured"), ("Equal", "Strong"), ("Slow", "Equal"), "Attack"),
+    (("NearDead",), ("NearDead", "Injured"), ("Weak",), ("Equal", "Fast"), "Flee"),
+    (("NearDead",), ("Normal",), ("Weak",), ("Equal", "Fast"), "Flee"),
+    (("NearDead",), ("Normal",), ("Equal", "Strong"), ("Fast",), "Flee"),
+    (("NearDead",), ("Injured",), ("Equal",), ("Fast",), "Flee"),
+)
+FUZZY_RUSH_RULES = (
+    (("Normal",), FUZZY_ANY_HEALTH, ("Strong",), FUZZY_ANY_SPEED, "Attack"),
+    (("Normal",), FUZZY_ANY_HEALTH, ("Weak", "Equal"), FUZZY_ANY_SPEED, "Flee"),
+    *FUZZY_DEFAULT_RULES[1:],
+)
 
 
 class NormalAIBot:
@@ -398,6 +428,7 @@ class NormalAIBot:
         self._squad_regroup_count: dict[str, int] = {}
         self._squad_last_commit_tick: dict[str, int] = {}
         self._enemy_base_pos: Optional[Tuple[int, int]] = None
+        self._rush_target_pos: Optional[Tuple[int, int]] = None
         self._stale_attack_target: Optional[Tuple[int, int]] = None
         self._stale_attack_redirects = 0
         self._search_target: Optional[Tuple[int, int]] = None
@@ -405,6 +436,7 @@ class NormalAIBot:
 
         # Repair / power
         self._repair_issued: set[int] = set()
+        self._reactive_repair_targets: set[int] = set()
         self._last_repair_tick = -9999
         self._powered_down: dict[int, int] = {}
         self._last_power_toggle_tick = -9999
@@ -421,6 +453,7 @@ class NormalAIBot:
         self._last_mcv_build_tick = -9999
         self._mcv_targets: dict[int, tuple[int, int]] = {}
         self._harvester_retreat_until: dict[int, int] = {}
+        self._harvester_recent_damage_until: dict[int, int] = {}
         self._harvester_reassign_until: dict[int, int] = {}
         self._harvester_patch_targets: dict[int, tuple[int, int]] = {}
         self._harvester_last_cells: dict[int, tuple[int, int]] = {}
@@ -434,6 +467,9 @@ class NormalAIBot:
         self._cached_map_size: Optional[Tuple[int, int]] = None
         self._candidate_targets: list[Tuple[int, int]] = []
         self._target_index = 0
+        self._recent_attack_points: list[tuple[int, int, int]] = []
+        self._previous_building_hp: dict[int, float] = {}
+        self._previous_unit_hp: dict[int, float] = {}
         self._spatial_raw: bytes = b""
         self._spatial_channels = 0
         self._last_spatial_update_tick = -9999
@@ -441,6 +477,8 @@ class NormalAIBot:
         self._resource_patch_memory: dict[tuple[int, int], dict[str, float | int]] = {}
         self._last_naval_gate_tick = -9999
         self._cached_naval_gate_ok = False
+        self._mcv_expansion_mode = MCV_EXPANSION_MODES[0]
+        self._mcv_expansion_failures = 0
 
     def decide(self, obs: OpenRAObservation) -> OpenRAAction:
         commands: List[CommandModel] = []
@@ -448,6 +486,7 @@ class NormalAIBot:
         self._update_spatial_analysis(obs)
         self._update_phase(obs)
         self._cleanup_dead(obs)
+        self._update_damage_memory(obs)
         self._update_post_contact_state(obs)
 
         commands.extend(self._handle_placement(obs))
@@ -1198,22 +1237,25 @@ class NormalAIBot:
         # OpenRA keeps rush squads separate from assault squads and periodically
         # moves all idle base units into the rush squad when the rush trigger fires.
         total_ground_troops = len(self._idle_ground_units) + len(self._attack_squad) + len(self._rush_squad) + len(self._protection_squad)
-        rush_ready = any(
-            uid in ground_by_id and ground_by_id[uid].can_attack
-            for uid in self._idle_ground_units
-        )
+        rush_units = [ground_by_id[uid] for uid in self._idle_ground_units if uid in ground_by_id]
         if (
             not self._base_under_pressure(obs)
             and obs.tick - self._last_rush_tick >= RUSH_INTERVAL
             and total_ground_troops >= SQUAD_SIZE
-            and rush_ready
+            and rush_units
         ):
-            launched = list(self._idle_ground_units)
-            existing_rush = set(self._rush_squad)
-            self._rush_squad.extend(uid for uid in launched if uid not in existing_rush)
-            self._idle_ground_units = []
-            self._last_rush_tick = obs.tick
-            self._log(f"Launching rush wave ({len(launched)} units)")
+            rush_target = self._select_rush_target(obs, rush_units)
+            if rush_target is not None:
+                launched = list(self._idle_ground_units)
+                existing_rush = set(self._rush_squad)
+                self._rush_squad.extend(uid for uid in launched if uid not in existing_rush)
+                self._idle_ground_units = []
+                self._last_rush_tick = obs.tick
+                self._rush_target_pos = rush_target
+                self._enemy_base_pos = rush_target
+                self._clear_search_target()
+                self._reset_stale_attack_target()
+                self._log(f"Launching rush wave ({len(launched)} units) -> {rush_target}")
 
         # Launch a fresh assault wave from idle base units once enough have accumulated.
         if (
@@ -1560,6 +1602,18 @@ class NormalAIBot:
         leader_y: Optional[int],
         squad_name: str = "assault",
     ) -> Tuple[int, int]:
+        if squad_name == "rush" and self._rush_target_pos is not None:
+            if self._should_clear_point_target(obs, self._rush_target_pos, leader_x, leader_y):
+                self._log(f"Clearing stale rush target {self._rush_target_pos}")
+                if self._enemy_base_pos == self._rush_target_pos:
+                    self._enemy_base_pos = None
+                self._rush_target_pos = None
+                self._reset_stale_attack_target()
+            else:
+                self._enemy_base_pos = self._rush_target_pos
+                self._clear_search_target()
+                return self._rush_target_pos
+
         priority = self._pick_priority_target(obs, None, None, local_only=False, squad_name=squad_name)
         if priority is not None:
             _, tx, ty, _, kind = priority
@@ -1572,6 +1626,8 @@ class NormalAIBot:
             return tx, ty
         if self._enemy_base_pos and self._should_clear_enemy_base_target(obs, leader_x, leader_y):
             self._log(f"Clearing stale enemy base target {self._enemy_base_pos}")
+            if self._rush_target_pos == self._enemy_base_pos:
+                self._rush_target_pos = None
             self._enemy_base_pos = None
             self._reset_stale_attack_target()
         if self._enemy_base_pos:
@@ -1605,14 +1661,26 @@ class NormalAIBot:
         leader_x: Optional[int],
         leader_y: Optional[int],
     ) -> bool:
-        if self._enemy_base_pos is None:
-            return False
+        return self._enemy_base_pos is not None and self._should_clear_point_target(
+            obs,
+            self._enemy_base_pos,
+            leader_x,
+            leader_y,
+        )
+
+    def _should_clear_point_target(
+        self,
+        obs: OpenRAObservation,
+        target: Tuple[int, int],
+        leader_x: Optional[int],
+        leader_y: Optional[int],
+    ) -> bool:
         if obs.visible_enemies or obs.visible_enemy_buildings:
             return False
         if obs.tick - self._last_attack_tick < STALE_TARGET_CLEAR_INTERVAL:
             return False
 
-        tx, ty = self._enemy_base_pos
+        tx, ty = target
         if (
             leader_x is not None
             and leader_y is not None
@@ -1621,7 +1689,7 @@ class NormalAIBot:
             return True
 
         return (
-            self._stale_attack_target == self._enemy_base_pos
+            self._stale_attack_target == target
             and self._stale_attack_redirects >= STALE_TARGET_REDIRECT_LIMIT
         )
 
@@ -1689,12 +1757,26 @@ class NormalAIBot:
 
     def _manage_repairs(self, obs: OpenRAObservation) -> List[CommandModel]:
         commands = []
+        for b in obs.buildings:
+            if b.hp_percent >= 0.98:
+                self._repair_issued.discard(b.actor_id)
+                self._reactive_repair_targets.discard(b.actor_id)
+                continue
+
+            if (
+                b.actor_id in self._reactive_repair_targets
+                and not b.is_repairing
+                and b.actor_id not in self._repair_issued
+                and self._available_credits(obs) >= 500
+            ):
+                commands.append(CommandModel(action=ActionType.REPAIR, actor_id=b.actor_id))
+                self._repair_issued.add(b.actor_id)
+                self._reactive_repair_targets.discard(b.actor_id)
+
         if obs.tick - self._last_repair_tick < REPAIR_ALL_BUILDINGS_COOLDOWN:
             return commands
         self._last_repair_tick = obs.tick
         for b in obs.buildings:
-            if b.hp_percent >= 0.98:
-                self._repair_issued.discard(b.actor_id)
             if (b.hp_percent < 0.75 and not b.is_repairing
                     and b.actor_id not in self._repair_issued
                     and self._available_credits(obs) >= 500):
@@ -1761,6 +1843,11 @@ class NormalAIBot:
         self._idle_ground_units = [uid for uid in self._idle_ground_units if uid in alive]
         self._temporary_defenders &= alive
         self._squad_regroup_count = {k: v for k, v in self._squad_regroup_count.items() if k in self._squad_states}
+        self._previous_unit_hp = {
+            actor_id: hp
+            for actor_id, hp in self._previous_unit_hp.items()
+            if actor_id in alive
+        }
         self._mcv_targets = {
             actor_id: target
             for actor_id, target in self._mcv_targets.items()
@@ -1768,7 +1855,13 @@ class NormalAIBot:
         }
         alive_b = {b.actor_id for b in obs.buildings}
         self._repair_issued &= alive_b
+        self._reactive_repair_targets &= alive_b
         self._rally_set &= alive_b
+        self._previous_building_hp = {
+            actor_id: hp
+            for actor_id, hp in self._previous_building_hp.items()
+            if actor_id in alive_b
+        }
         self._powered_down = {
             actor_id: expected_change
             for actor_id, expected_change in self._powered_down.items()
@@ -1777,6 +1870,11 @@ class NormalAIBot:
         self._harvester_retreat_until = {
             actor_id: tick
             for actor_id, tick in self._harvester_retreat_until.items()
+            if actor_id in alive
+        }
+        self._harvester_recent_damage_until = {
+            actor_id: tick
+            for actor_id, tick in self._harvester_recent_damage_until.items()
             if actor_id in alive
         }
         self._harvester_reassign_until = {
@@ -1804,6 +1902,49 @@ class NormalAIBot:
             for actor_id, tick in self._harvester_no_resource_until.items()
             if actor_id in alive
         }
+        self._recent_attack_points = [
+            (x, y, tick)
+            for x, y, tick in self._recent_attack_points
+            if obs.tick - tick <= BASE_ATTACK_MEMORY_TICKS
+        ]
+        if not self._rush_squad:
+            self._rush_target_pos = None
+
+    def _update_damage_memory(self, obs: OpenRAObservation):
+        self._recent_attack_points = [
+            (x, y, tick)
+            for x, y, tick in self._recent_attack_points
+            if obs.tick - tick <= BASE_ATTACK_MEMORY_TICKS
+        ]
+
+        next_building_hp: dict[int, float] = {}
+        for building in obs.buildings:
+            next_building_hp[building.actor_id] = building.hp_percent
+            previous_hp = self._previous_building_hp.get(building.actor_id)
+            if previous_hp is not None and building.hp_percent + 1e-6 < previous_hp:
+                bx, by = self._actor_cell(building)
+                self._remember_attack_point(bx, by, obs.tick)
+                if previous_hp >= REPAIR_REACTIVE_HP_THRESHOLD and building.hp_percent < REPAIR_REACTIVE_HP_THRESHOLD:
+                    self._reactive_repair_targets.add(building.actor_id)
+        self._previous_building_hp = next_building_hp
+
+        next_unit_hp: dict[int, float] = {}
+        for unit in obs.units:
+            next_unit_hp[unit.actor_id] = unit.hp_percent
+            previous_hp = self._previous_unit_hp.get(unit.actor_id)
+            if previous_hp is not None and unit.hp_percent + 1e-6 < previous_hp:
+                if unit.type in {"harv", "mcv"}:
+                    self._remember_attack_point(unit.cell_x, unit.cell_y, obs.tick)
+                if unit.type == "harv":
+                    self._harvester_recent_damage_until[unit.actor_id] = obs.tick + HARVESTER_RETREAT_COOLDOWN
+        self._previous_unit_hp = next_unit_hp
+
+    def _remember_attack_point(self, x: int, y: int, tick: int) -> None:
+        for idx, (px, py, _) in enumerate(self._recent_attack_points):
+            if self._cell_distance(x, y, px, py) <= ATTACK_POINT_MERGE_RADIUS:
+                self._recent_attack_points[idx] = ((px + x) // 2, (py + y) // 2, tick)
+                return
+        self._recent_attack_points.append((x, y, tick))
 
     def _update_post_contact_state(self, obs: OpenRAObservation):
         combat_count = self._combat_unit_count(obs)
@@ -2145,11 +2286,17 @@ class NormalAIBot:
 
     def _base_threat_enemies(self, obs: OpenRAObservation) -> list[UnitInfoModel]:
         protected_points = self._protected_points(obs)
-        if not protected_points:
+        emergency_points = [
+            (x, y, BASE_EMERGENCY_VISIBILITY_RADIUS)
+            for x, y, tick in self._recent_attack_points
+            if obs.tick - tick <= BASE_ATTACK_MEMORY_TICKS
+        ]
+        threat_points = protected_points + emergency_points
+        if not threat_points:
             return []
         return [
             e for e in obs.visible_enemies
-            if any(self._cell_distance(e.cell_x, e.cell_y, px, py) <= radius for px, py, radius in protected_points)
+            if any(self._cell_distance(e.cell_x, e.cell_y, px, py) <= radius for px, py, radius in threat_points)
         ]
 
     def _base_under_pressure(self, obs: OpenRAObservation) -> bool:
@@ -3530,6 +3677,178 @@ class NormalAIBot:
         attack_range = getattr(actor, "attack_range", 0)
         return base * max(0.2, hp) * (1.0 + min(speed / 200.0, 0.25) + min(attack_range / 12000.0, 0.25))
 
+    def _building_can_attack(self, building: BuildingInfoModel) -> bool:
+        return (
+            self._canonical_building_type(building.type) in ATTACKING_BUILDING_TYPES
+            and getattr(building, "is_powered", True)
+        )
+
+    def _actor_cell(self, actor) -> Tuple[int, int]:
+        if getattr(actor, "cell_x", 0) > 0 or getattr(actor, "cell_y", 0) > 0:
+            return actor.cell_x, actor.cell_y
+        return actor.pos_x // 1024, actor.pos_y // 1024
+
+    def _attack_or_flee_rules(self, rush: bool) -> tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...], str], ...]:
+        return FUZZY_RUSH_RULES if rush else FUZZY_DEFAULT_RULES
+
+    def _fuzzy_trapezoid(self, value: float, left: float, left_top: float, right_top: float, right: float) -> float:
+        if value <= left or value >= right:
+            if (value == left == left_top) or (value == right == right_top):
+                return 1.0
+            return 0.0
+        if left_top <= value <= right_top:
+            return 1.0
+        if value < left_top:
+            if left_top == left:
+                return 1.0
+            return (value - left) / (left_top - left)
+        if right == right_top:
+            return 1.0
+        return (right - value) / (right - right_top)
+
+    def _fuzzy_input_membership(self, variable: str, term: str, value: float) -> float:
+        if variable in {"OwnHealth", "EnemyHealth"}:
+            shapes = {
+                "NearDead": (0.0, 0.0, 20.0, 40.0),
+                "Injured": (30.0, 50.0, 50.0, 70.0),
+                "Normal": (50.0, 80.0, 100.0, 100.0),
+            }
+        else:
+            shapes = {
+                "Weak": (0.0, 0.0, 70.0, 90.0),
+                "Equal": (85.0, 100.0, 100.0, 115.0),
+                "Strong": (110.0, 150.0, 150.0, 1000.0),
+                "Slow": (0.0, 0.0, 70.0, 90.0),
+                "Fast": (110.0, 150.0, 150.0, 1000.0),
+            }
+        left, left_top, right_top, right = shapes[term]
+        return self._fuzzy_trapezoid(value, left, left_top, right_top, right)
+
+    def _fuzzy_output_membership(self, term: str, value: float) -> float:
+        shapes = {
+            "Attack": (0.0, 15.0, 15.0, 30.0),
+            "Flee": (25.0, 35.0, 35.0, 50.0),
+        }
+        left, left_top, right_top, right = shapes[term]
+        return self._fuzzy_trapezoid(value, left, left_top, right_top, right)
+
+    def _normalized_health(self, actors: list) -> float:
+        if not actors:
+            return 0.0
+        return max(0.0, min(100.0, 100.0 * sum(max(0.0, getattr(actor, "hp_percent", 1.0)) for actor in actors) / len(actors)))
+
+    def _attack_power_metric(self, actors: list) -> float:
+        total = 0.0
+        for actor in actors:
+            if isinstance(actor, UnitInfoModel):
+                if actor.can_attack:
+                    total += UNIT_COMBAT_POWER.get(actor.type, 0)
+            elif isinstance(actor, BuildingInfoModel) and self._building_can_attack(actor):
+                total += BUILDING_THREAT_POWER.get(actor.type, 0)
+        return total
+
+    def _speed_metric(self, actors: list) -> float:
+        speeds = [max(0, getattr(actor, "speed", 0)) for actor in actors if isinstance(actor, UnitInfoModel) and getattr(actor, "speed", 0) > 0]
+        if not speeds:
+            return 0.0
+        return sum(speeds) / len(speeds)
+
+    def _relative_metric(self, own_value: float, enemy_value: float) -> float:
+        if enemy_value <= 0:
+            return 999.0 if own_value > 0 else 100.0
+        if own_value <= 0:
+            return 0.0
+        return max(0.0, min(999.0, own_value / enemy_value * 100.0))
+
+    def _attack_or_flee_score(self, own_actors: list, enemy_actors: list, rush: bool) -> Optional[float]:
+        inputs = {
+            "OwnHealth": self._normalized_health(own_actors),
+            "EnemyHealth": self._normalized_health(enemy_actors),
+            "RelativeAttackPower": self._relative_metric(
+                self._attack_power_metric(own_actors),
+                self._attack_power_metric(enemy_actors),
+            ),
+            "RelativeSpeed": self._relative_metric(
+                self._speed_metric(own_actors),
+                self._speed_metric(enemy_actors),
+            ),
+        }
+
+        activation = {"Attack": 0.0, "Flee": 0.0}
+        for own_terms, enemy_terms, power_terms, speed_terms, outcome in self._attack_or_flee_rules(rush):
+            degree = min(
+                max(self._fuzzy_input_membership("OwnHealth", term, inputs["OwnHealth"]) for term in own_terms),
+                max(self._fuzzy_input_membership("EnemyHealth", term, inputs["EnemyHealth"]) for term in enemy_terms),
+                max(self._fuzzy_input_membership("RelativeAttackPower", term, inputs["RelativeAttackPower"]) for term in power_terms),
+                max(self._fuzzy_input_membership("RelativeSpeed", term, inputs["RelativeSpeed"]) for term in speed_terms),
+            )
+            activation[outcome] = max(activation[outcome], degree)
+
+        if activation["Attack"] <= 0.0 and activation["Flee"] <= 0.0:
+            return None
+
+        numerator = 0.0
+        denominator = 0.0
+        for sample in range(101):
+            value = sample * 0.5
+            membership = max(
+                min(activation["Attack"], self._fuzzy_output_membership("Attack", value)),
+                min(activation["Flee"], self._fuzzy_output_membership("Flee", value)),
+            )
+            numerator += value * membership
+            denominator += membership
+
+        if denominator <= 0.0:
+            return None
+        return numerator / denominator
+
+    def _attack_or_flee_can_attack(self, own_actors: list, enemy_actors: list, rush: bool) -> bool:
+        score = self._attack_or_flee_score(own_actors, enemy_actors, rush)
+        return score is not None and score < 30.0
+
+    def _select_rush_target(
+        self,
+        obs: OpenRAObservation,
+        rush_units: list[UnitInfoModel],
+    ) -> Optional[Tuple[int, int]]:
+        attackable_units = [
+            unit for unit in rush_units
+            if unit.can_attack and unit.type not in AIRCRAFT_TYPES | SHIP_TYPES
+        ]
+        if not attackable_units:
+            return None
+
+        sample_unit = random.choice(attackable_units)
+        conyards = [
+            building for building in obs.visible_enemy_buildings
+            if self._canonical_building_type(building.type) == "fact"
+        ]
+        conyards.sort(key=lambda building: self._cell_distance(sample_unit.cell_x, sample_unit.cell_y, *self._actor_cell(building)))
+
+        for conyard in conyards:
+            cx, cy = self._actor_cell(conyard)
+            defenders: list = [
+                enemy
+                for enemy in obs.visible_enemies
+                if enemy.can_attack
+                and enemy.type not in AIRCRAFT_TYPES | SHIP_TYPES
+                and self._cell_distance(enemy.cell_x, enemy.cell_y, cx, cy) <= RUSH_ATTACK_SCAN_RADIUS
+            ]
+            defenders.extend(
+                building
+                for building in obs.visible_enemy_buildings
+                if building.actor_id != conyard.actor_id
+                and self._building_can_attack(building)
+                and self._cell_distance(*self._actor_cell(building), cx, cy) <= RUSH_ATTACK_SCAN_RADIUS
+            )
+            if not self._attack_or_flee_can_attack(attackable_units, defenders, rush=True):
+                continue
+
+            target = random.choice(defenders) if defenders else conyard
+            return self._actor_cell(target)
+
+        return None
+
     def _should_take_local_fight(
         self,
         squad_units: list[UnitInfoModel],
@@ -3542,6 +3861,12 @@ class NormalAIBot:
         own_units = [u for u in squad_units if u.can_attack]
         if not own_units:
             return False
+
+        if squad_name in {"assault", "rush"}:
+            enemy_actors = list(enemy_units) + list(enemy_buildings)
+            if cautious and self._normalized_health(own_units) < 55.0:
+                return False
+            return self._attack_or_flee_can_attack(own_units, enemy_actors, rush=rush)
 
         own_power = sum(self._estimate_combat_power(u) for u in own_units)
         enemy_power = (
