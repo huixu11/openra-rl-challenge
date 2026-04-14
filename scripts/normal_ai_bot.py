@@ -25,6 +25,9 @@ from openra_env.models import (
     UnitInfoModel,
 )
 
+STANCE_DEFEND = 2
+STANCE_ATTACK_ANYTHING = 3
+
 # ---------------------------------------------------------------------------
 # Constants from ai.yaml (@normal)
 # ---------------------------------------------------------------------------
@@ -340,6 +343,11 @@ RUSH_COMBAT_TYPES = {"e1", "e3", "apc", "jeep", "1tnk", "2tnk", "3tnk", "arty", 
 FORCE_COMMIT_UNIT_THRESHOLD = 30
 FORCE_COMMIT_REGROUPS = 3
 FORCE_COMMIT_COOLDOWN = 400
+FORCE_COMMIT_TIME = 1200  # fallback wave timing (ticks) to mirror NormalAI periodic pushes
+FORCE_COMMIT_MIN_SIZE = 12
+FORCE_COMMIT_GLOBAL_INTERVAL = 1200  # hard periodic wave, closer to NormalAI cadence
+STALE_TARGET_CLEAR_INTERVAL = 2400  # reduce aggressive stale clearing
+SEARCH_TARGET_STALL_TICKS = 3600
 
 
 class NormalAIBot:
@@ -373,6 +381,7 @@ class NormalAIBot:
         self._naval_squad: list[int] = []
         self._temporary_defenders: set[int] = set()
         self._last_attack_tick = 0
+        self._last_attack_eval_tick = 0
         self._last_rush_tick = 0
         self._last_assign_tick = 0
         self._last_protection_tick = -9999
@@ -390,6 +399,8 @@ class NormalAIBot:
         self._enemy_base_pos: Optional[Tuple[int, int]] = None
         self._stale_attack_target: Optional[Tuple[int, int]] = None
         self._stale_attack_redirects = 0
+        self._search_target: Optional[Tuple[int, int]] = None
+        self._search_target_started_tick = -9999
 
         # Repair / power
         self._repair_issued: set[int] = set()
@@ -1122,10 +1133,11 @@ class NormalAIBot:
 
         commands.extend(self._handle_defense(obs))
 
-        if obs.tick - self._last_attack_tick >= ATTACK_FORCE_INTERVAL:
-            self._last_attack_tick = obs.tick
+        if obs.tick - self._last_attack_eval_tick >= ATTACK_FORCE_INTERVAL:
+            self._last_attack_eval_tick = obs.tick
             commands.extend(self._handle_attack(obs))
 
+        commands.extend(self._manage_unit_stances(obs))
         return commands
 
     def _assign_squad_roles(self, obs: OpenRAObservation):
@@ -1250,6 +1262,22 @@ class NormalAIBot:
             )
         return candidates[:needed]
 
+    def _manage_unit_stances(self, obs: OpenRAObservation) -> List[CommandModel]:
+        protection_ids = set(self._protection_squad) | set(self._temporary_defenders)
+        commands: list[CommandModel] = []
+        for unit in obs.units:
+            if unit.type not in COMBAT_TYPES or not unit.can_attack:
+                continue
+            desired_stance = STANCE_DEFEND if unit.actor_id in protection_ids else STANCE_ATTACK_ANYTHING
+            if unit.stance == desired_stance:
+                continue
+            commands.append(CommandModel(
+                action=ActionType.SET_STANCE,
+                actor_id=unit.actor_id,
+                target_x=desired_stance,
+            ))
+        return commands
+
     def _handle_field_squad(
         self,
         obs: OpenRAObservation,
@@ -1323,7 +1351,15 @@ class NormalAIBot:
             assemble_commands = self._assemble_squad_commands(obs, squad_name, squad_units)
             return assemble_commands
 
-        if len(squad_units) < minimum_commitment:
+        # Precompute a global force trigger (unconditional periodic wave) to avoid early exit on minimum_commitment
+        force_global = False
+        force_commit = False
+        if squad_name in {"assault", "rush"} and squad_units:
+            if obs.tick - self._last_attack_tick >= FORCE_COMMIT_GLOBAL_INTERVAL:
+                force_global = True
+                force_commit = True
+
+        if len(squad_units) < minimum_commitment and not force_global:
             self._set_squad_state(squad_name, "assemble")
             if squad_name == "assault":
                 self._assault_threshold = self._roll_assault_threshold()
@@ -1336,31 +1372,53 @@ class NormalAIBot:
             self._set_squad_state(squad_name, "assemble")
             return commands
 
-        force_commit = False
+        # Continue evaluating other force-commit paths (regroup/time-based); retain any global trigger from above
         if squad_name in {"assault", "rush"}:
             regroup_attempts = self._squad_regroup_count.get(squad_name, 0)
             last_commit_tick = self._squad_last_commit_tick.get(squad_name, -9999)
+            time_since_commit = obs.tick - last_commit_tick
             if (
                 regroup_attempts >= FORCE_COMMIT_REGROUPS
                 and len(squad_units) >= FORCE_COMMIT_UNIT_THRESHOLD
                 and not local_enemy_units
                 and not local_enemy_buildings
-                and obs.tick - last_commit_tick >= FORCE_COMMIT_COOLDOWN
+                and time_since_commit >= FORCE_COMMIT_COOLDOWN
                 and not self._base_under_pressure(obs)
             ):
                 force_commit = True
+            # Timed fallback push toward known target (mirror NormalAI periodic wave)
+            if (
+                not force_commit
+                and len(squad_units) >= max(FORCE_COMMIT_MIN_SIZE, minimum_commitment)
+                and time_since_commit >= FORCE_COMMIT_TIME
+            ):
+                force_commit = True
+            # Hard periodic global wave aligned to NormalAI cadence
+            if (
+                not force_commit
+                # remove size gating to mirror C# periodic pushes
+                and len(squad_units) >= 1
+                and obs.tick - self._last_attack_tick >= FORCE_COMMIT_GLOBAL_INTERVAL
+            ):
+                force_commit = True
+                force_global = True
 
         regroup_commands = self._regroup_squad_commands(squad_units, leader)
-        if regroup_commands:
+        if regroup_commands and not force_global:
             self._set_squad_state(squad_name, "regroup")
             self._squad_regroup_count[squad_name] = self._squad_regroup_count.get(squad_name, 0) + 1
             return regroup_commands
 
         self._set_squad_state(squad_name, "commit")
-        tx, ty = self._find_attack_target(obs, leader.cell_x, leader.cell_y, squad_name=squad_name)
+        target = self._find_attack_target(obs, leader.cell_x, leader.cell_y, squad_name=squad_name)
+        if target is None:
+            fallback = self._enemy_base_pos or (self._get_map_size()[0] // 2, self._get_map_size()[1] // 2)
+            tx, ty = fallback
+        else:
+            tx, ty = target
         if squad_name in {"assault", "rush"}:
             self._track_stale_attack_target(obs, leader, tx, ty)
-        if force_commit and squad_name == "assault":
+        if (force_commit or force_global) and squad_name == "assault":
             attackers = squad_units
         else:
             attackers = self._attack_wave_units(obs, squad_units) if squad_name == "assault" else squad_units
@@ -1374,6 +1432,7 @@ class NormalAIBot:
         if commands and rush:
             self._last_rush_tick = obs.tick
         if commands:
+            self._last_attack_tick = obs.tick
             self._squad_regroup_count[squad_name] = 0
             self._squad_last_commit_tick[squad_name] = obs.tick
         return commands
@@ -1487,6 +1546,7 @@ class NormalAIBot:
                 self._enemy_base_pos = (tx, ty)
             elif self._enemy_base_pos is None:
                 self._enemy_base_pos = (tx, ty)
+            self._clear_search_target()
             self._reset_stale_attack_target()
             return tx, ty
         if self._enemy_base_pos and self._should_clear_enemy_base_target(obs, leader_x, leader_y):
@@ -1494,12 +1554,9 @@ class NormalAIBot:
             self._enemy_base_pos = None
             self._reset_stale_attack_target()
         if self._enemy_base_pos:
+            self._clear_search_target()
             return self._enemy_base_pos
-        if not self._candidate_targets:
-            self._candidate_targets = self._search_grid(obs)
-        t = self._candidate_targets[self._target_index % len(self._candidate_targets)]
-        self._target_index = (self._target_index + 1) % len(self._candidate_targets)
-        return t
+        return self._select_search_target(obs, leader_x, leader_y)
 
     def _track_stale_attack_target(
         self,
@@ -1531,6 +1588,8 @@ class NormalAIBot:
             return False
         if obs.visible_enemies or obs.visible_enemy_buildings:
             return False
+        if obs.tick - self._last_attack_tick < STALE_TARGET_CLEAR_INTERVAL:
+            return False
 
         tx, ty = self._enemy_base_pos
         if (
@@ -1548,6 +1607,44 @@ class NormalAIBot:
     def _reset_stale_attack_target(self) -> None:
         self._stale_attack_target = None
         self._stale_attack_redirects = 0
+
+    def _clear_search_target(self) -> None:
+        self._search_target = None
+        self._search_target_started_tick = -9999
+
+    def _advance_search_target(self, obs: OpenRAObservation) -> Tuple[int, int]:
+        if not self._candidate_targets:
+            self._candidate_targets = self._search_grid(obs)
+            self._target_index = 0
+        target = self._candidate_targets[self._target_index % len(self._candidate_targets)]
+        self._target_index = (self._target_index + 1) % len(self._candidate_targets)
+        self._search_target = target
+        self._search_target_started_tick = obs.tick
+        self._log(f"Search target -> {target}")
+        return target
+
+    def _select_search_target(
+        self,
+        obs: OpenRAObservation,
+        leader_x: Optional[int],
+        leader_y: Optional[int],
+    ) -> Tuple[int, int]:
+        if self._search_target is None:
+            return self._advance_search_target(obs)
+
+        if (
+            leader_x is not None
+            and leader_y is not None
+            and self._cell_distance(leader_x, leader_y, self._search_target[0], self._search_target[1])
+            <= STALE_TARGET_REACHED_RADIUS
+        ):
+            return self._advance_search_target(obs)
+
+        if obs.tick - self._search_target_started_tick >= SEARCH_TARGET_STALL_TICKS:
+            self._log(f"Search target stalled -> rotating from {self._search_target}")
+            return self._advance_search_target(obs)
+
+        return self._search_target
 
     def _search_grid(self, obs: OpenRAObservation) -> list[Tuple[int, int]]:
         w, h = self._get_map_size()
@@ -1728,6 +1825,8 @@ class NormalAIBot:
                 if w < cw or h < ch:
                     self._cached_map_size = (w, h)
                     self._candidate_targets = []
+                    self._target_index = 0
+                    self._clear_search_target()
 
     def _get_map_size(self) -> Tuple[int, int]:
         return self._cached_map_size or (128, 128)
