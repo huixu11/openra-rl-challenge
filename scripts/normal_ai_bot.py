@@ -57,8 +57,8 @@ COMBAT_TYPES = (
     AIRCRAFT_TYPES
 )
 
-SQUAD_SIZE = 28
-SQUAD_SIZE_RANDOM_BONUS = 10
+SQUAD_SIZE = 40
+SQUAD_SIZE_RANDOM_BONUS = 30
 EXCLUDE_FROM_SQUADS = {"harv", "mcv", "dog", "badr.bomber", "u2"}
 BARRACKS_TYPES = {"tent", "barr"}
 WAR_FACTORY_TYPES = {"weap"}
@@ -379,6 +379,7 @@ class NormalAIBot:
         self._rush_squad: list[int] = []
         self._air_squad: list[int] = []
         self._naval_squad: list[int] = []
+        self._idle_ground_units: list[int] = []
         self._temporary_defenders: set[int] = set()
         self._last_attack_tick = 0
         self._last_attack_eval_tick = 0
@@ -1149,49 +1150,82 @@ class NormalAIBot:
         air_ids = [u.actor_id for u in combat_units if u.type in AIRCRAFT_TYPES]
         naval_ids = [u.actor_id for u in combat_units if u.type in SHIP_TYPES]
         ground_units = [u for u in combat_units if u.type not in AIRCRAFT_TYPES | SHIP_TYPES]
+        ground_by_id = {u.actor_id: u for u in ground_units}
+
+        self._air_squad = air_ids
+        self._naval_squad = naval_ids
+
+        # Keep squad membership persistent instead of re-slicing ground units every assign tick.
+        self._attack_squad = [uid for uid in self._attack_squad if uid in ground_by_id]
+        self._rush_squad = [uid for uid in self._rush_squad if uid in ground_by_id]
+
+        self._idle_ground_units = [
+            uid for uid in self._idle_ground_units
+            if uid in ground_by_id and uid not in set(self._attack_squad) and uid not in set(self._rush_squad)
+        ]
+        self._protection_squad = [
+            uid for uid in self._protection_squad
+            if uid in ground_by_id and uid not in set(self._attack_squad) and uid not in set(self._rush_squad)
+        ]
+
+        assigned_ground = set(self._attack_squad) | set(self._rush_squad) | set(self._idle_ground_units) | set(self._protection_squad)
+        unassigned_ground = [u for u in ground_units if u.actor_id not in assigned_ground]
 
         base_center = self._base_center(obs)
         if base_center is not None:
-            ground_units.sort(
+            unassigned_ground.sort(
                 key=lambda u: self._cell_distance(u.cell_x, u.cell_y, base_center[0], base_center[1])
             )
         else:
-            ground_units.sort(key=lambda u: u.actor_id)
+            unassigned_ground.sort(key=lambda u: u.actor_id)
 
-        protection_count = 0
-        if ground_units:
-            if len(ground_units) < self._assault_threshold:
-                protection_count = min(max(2, len(ground_units) // 4), max(0, len(ground_units) // 2))
-            else:
-                protection_count = min(HOME_GUARD_MAX_RESERVE, max(PROTECTION_SQUAD_MIN_SIZE, len(ground_units) // 5))
-            if self._base_under_pressure(obs):
-                protection_count = min(HOME_GUARD_MAX_RESERVE, max(PROTECTION_SQUAD_MIN_SIZE, protection_count + 2))
-            keep_for_field = max(4, self._assault_threshold // 3)
-            protection_count = min(protection_count, max(0, len(ground_units) - keep_for_field))
-            if self._base_under_pressure(obs) and protection_count == 0:
-                protection_count = min(len(ground_units), PROTECTION_SQUAD_MIN_SIZE)
+        self._idle_ground_units.extend(u.actor_id for u in unassigned_ground)
 
-        protection_ids = [u.actor_id for u in ground_units[:protection_count]]
-        remaining_ground = [u for u in ground_units if u.actor_id not in set(protection_ids)]
+        # Dedicate a small local defense group only when there is an actual base threat.
+        if self._base_under_pressure(obs) and self._idle_ground_units:
+            idle_units = [ground_by_id[uid] for uid in self._idle_ground_units if uid in ground_by_id]
+            if base_center is not None:
+                idle_units.sort(
+                    key=lambda u: self._cell_distance(u.cell_x, u.cell_y, base_center[0], base_center[1])
+                )
+            protection_count = min(len(idle_units), PROTECTION_SQUAD_MIN_SIZE)
+            self._protection_squad = [u.actor_id for u in idle_units[:protection_count]]
+            protection_ids = set(self._protection_squad)
+            self._idle_ground_units = [uid for uid in self._idle_ground_units if uid not in protection_ids]
+        else:
+            self._protection_squad = []
 
-        rush_ids: list[int] = []
-        rush_candidates = [u for u in remaining_ground if u.type in RUSH_COMBAT_TYPES]
-        rush_window_open = obs.tick < RUSH_TICKS or obs.tick - self._last_rush_tick >= RUSH_INTERVAL
-        if rush_window_open and rush_candidates:
-            rush_count = min(
-                len(rush_candidates),
-                max(RUSH_SQUAD_MIN_SIZE, len(rush_candidates) // 2),
-            )
-            keep_for_assault = max(4, self._assault_threshold // 3)
-            rush_count = min(rush_count, max(0, len(remaining_ground) - keep_for_assault))
-            rush_ids = [u.actor_id for u in rush_candidates[:rush_count]]
+        # OpenRA keeps rush squads separate from assault squads and periodically
+        # moves all idle base units into the rush squad when the rush trigger fires.
+        total_ground_troops = len(self._idle_ground_units) + len(self._attack_squad) + len(self._rush_squad) + len(self._protection_squad)
+        rush_ready = any(
+            uid in ground_by_id and ground_by_id[uid].can_attack
+            for uid in self._idle_ground_units
+        )
+        if (
+            not self._base_under_pressure(obs)
+            and obs.tick - self._last_rush_tick >= RUSH_INTERVAL
+            and total_ground_troops >= SQUAD_SIZE
+            and rush_ready
+        ):
+            launched = list(self._idle_ground_units)
+            existing_rush = set(self._rush_squad)
+            self._rush_squad.extend(uid for uid in launched if uid not in existing_rush)
+            self._idle_ground_units = []
+            self._last_rush_tick = obs.tick
+            self._log(f"Launching rush wave ({len(launched)} units)")
 
-        rush_id_set = set(rush_ids)
-        self._protection_squad = protection_ids
-        self._rush_squad = rush_ids
-        self._attack_squad = [u.actor_id for u in remaining_ground if u.actor_id not in rush_id_set]
-        self._air_squad = air_ids
-        self._naval_squad = naval_ids
+        # Launch a fresh assault wave from idle base units once enough have accumulated.
+        if (
+            not self._base_under_pressure(obs)
+            and len(self._idle_ground_units) >= self._assault_threshold
+        ):
+            launched = list(self._idle_ground_units)
+            existing_attack = set(self._attack_squad)
+            self._attack_squad.extend(uid for uid in launched if uid not in existing_attack)
+            self._idle_ground_units = []
+            self._assault_threshold = self._roll_assault_threshold()
+            self._log(f"Launching assault wave ({len(launched)} units)")
 
     def _squad_units(self, obs: OpenRAObservation, squad_ids: list[int]) -> list[UnitInfoModel]:
         alive = {u.actor_id: u for u in obs.units}
@@ -1252,7 +1286,7 @@ class NormalAIBot:
         reserve_ids = set(self._protection_squad)
         candidates = [
             alive[uid]
-            for uid in self._rush_squad + self._attack_squad
+            for uid in self._idle_ground_units + self._rush_squad + self._attack_squad
             if uid in alive and uid not in reserve_ids and alive[uid].can_attack
         ]
         base_center = self._base_center(obs)
@@ -1326,8 +1360,6 @@ class NormalAIBot:
             )
             if priority_target is not None:
                 self._set_squad_state(squad_name, "commit")
-                if rush:
-                    self._last_rush_tick = obs.tick
                 focus_commands = self._focus_fire_commands(squad_units, priority_target)
                 if focus_commands:
                     return focus_commands
@@ -1341,15 +1373,6 @@ class NormalAIBot:
 
         if state == "recover" and not (local_enemy_units or local_enemy_buildings):
             return self._assemble_squad_commands(obs, squad_name, squad_units)
-
-        if self._base_under_pressure(obs) and squad_name in {"assault", "rush"} and not (local_enemy_units or local_enemy_buildings):
-            self._set_squad_state(squad_name, "recover", obs.tick + SQUAD_RECOVER_HOLD_TICKS)
-            return self._assemble_squad_commands(obs, squad_name, squad_units)
-
-        if self._in_recovery_mode(obs) and squad_name in {"assault", "rush"}:
-            self._set_squad_state(squad_name, "recover", obs.tick + SQUAD_RECOVER_HOLD_TICKS)
-            assemble_commands = self._assemble_squad_commands(obs, squad_name, squad_units)
-            return assemble_commands
 
         # Precompute a global force trigger (unconditional periodic wave) to avoid early exit on minimum_commitment
         force_global = False
@@ -1429,8 +1452,6 @@ class NormalAIBot:
                 target_x=tx,
                 target_y=ty,
             ))
-        if commands and rush:
-            self._last_rush_tick = obs.tick
         if commands:
             self._last_attack_tick = obs.tick
             self._squad_regroup_count[squad_name] = 0
@@ -1499,7 +1520,7 @@ class NormalAIBot:
                 obs,
                 "assault",
                 [u for u in self._squad_units(obs, self._attack_squad) if u.actor_id not in self._temporary_defenders],
-                self._assault_threshold,
+                1,
                 rush=False,
             )
         )
@@ -1508,7 +1529,7 @@ class NormalAIBot:
                 obs,
                 "rush",
                 [u for u in self._squad_units(obs, self._rush_squad) if u.actor_id not in self._temporary_defenders],
-                RUSH_SQUAD_MIN_SIZE,
+                1,
                 rush=True,
             )
         )
@@ -1737,6 +1758,7 @@ class NormalAIBot:
         self._rush_squad = [uid for uid in self._rush_squad if uid in alive]
         self._air_squad = [uid for uid in self._air_squad if uid in alive]
         self._naval_squad = [uid for uid in self._naval_squad if uid in alive]
+        self._idle_ground_units = [uid for uid in self._idle_ground_units if uid in alive]
         self._temporary_defenders &= alive
         self._squad_regroup_count = {k: v for k, v in self._squad_regroup_count.items() if k in self._squad_states}
         self._mcv_targets = {
@@ -2084,7 +2106,7 @@ class NormalAIBot:
         return sum(1 for u in obs.units if u.type in COMBAT_TYPES)
 
     def _in_recovery_mode(self, obs: OpenRAObservation) -> bool:
-        return obs.tick < self._recovery_until_tick
+        return False
 
     def _base_center(self, obs: OpenRAObservation) -> Optional[Tuple[int, int]]:
         cy = self._find_building(obs, "fact")
@@ -3439,42 +3461,7 @@ class NormalAIBot:
         obs: OpenRAObservation,
         squad_units: list[UnitInfoModel],
     ) -> list[UnitInfoModel]:
-        base_center = self._base_center(obs)
-        if base_center is None:
-            return squad_units
-
-        dedicated_defenders = len(self._protection_squad) + len(self._temporary_defenders)
-        if self._base_under_pressure(obs):
-            if dedicated_defenders >= PROTECTION_SQUAD_MIN_SIZE:
-                return squad_units
-            reserve = min(len(squad_units), max(2, PROTECTION_SQUAD_MIN_SIZE - dedicated_defenders))
-            if reserve <= 0:
-                return squad_units
-
-            bx, by = base_center
-            nearest_to_base = sorted(
-                squad_units,
-                key=lambda u: self._cell_distance(u.cell_x, u.cell_y, bx, by),
-            )
-            reserve_ids = {u.actor_id for u in nearest_to_base[:reserve]}
-            attackers = [u for u in squad_units if u.actor_id not in reserve_ids]
-            return attackers or squad_units
-
-        reserve = max(HOME_GUARD_MIN_RESERVE, len(squad_units) // 5)
-        reserve = min(HOME_GUARD_MAX_RESERVE, reserve)
-        reserve = max(0, reserve - min(dedicated_defenders, HOME_GUARD_MIN_RESERVE))
-        reserve = min(reserve, max(0, len(squad_units) - max(10, self._assault_threshold // 2)))
-        if reserve <= 0:
-            return squad_units
-
-        bx, by = base_center
-        nearest_to_base = sorted(
-            squad_units,
-            key=lambda u: self._cell_distance(u.cell_x, u.cell_y, bx, by),
-        )
-        reserve_ids = {u.actor_id for u in nearest_to_base[:reserve]}
-        attackers = [u for u in squad_units if u.actor_id not in reserve_ids]
-        return attackers or squad_units
+        return squad_units
 
     def _regroup_squad_commands(
         self,
