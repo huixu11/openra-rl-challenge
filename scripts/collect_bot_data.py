@@ -503,6 +503,7 @@ async def collect_all(
     output_dir: Path,
     verbose: bool,
     bot_type: str = "scripted",
+    save_json: bool = False,
 ):
     """Collect multiple episodes sequentially."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -534,9 +535,10 @@ async def collect_all(
         replay_info = copy_replay_artifact(episode_data.get("replay", {}), output_dir, i)
         episode_error = episode_data.get("error", "")
 
-        # Save trajectory (streaming write helps for huge episodes)
         filename = output_dir / f"episode_{i:03d}.json"
-        write_json_array_stream(filename, trajectory)
+        if save_json:
+            # Save trajectory (streaming write helps for huge episodes)
+            write_json_array_stream(filename, trajectory)
 
         # Compute summary
         final = trajectory[-1]["observation"] if trajectory else {}
@@ -562,18 +564,21 @@ async def collect_all(
             "final_buildings": final_buildings,
             "final_units": final_units,
             "elapsed_s": round(elapsed, 1),
-            "file": str(filename),
+            "file": str(filename) if save_json else "",
             "replay_path": replay_info.get("path", ""),
             "replay_local_copy": replay_info.get("local_copy", ""),
             "error": episode_error,
         }
         summaries.append(summary)
 
-        file_size_mb = filename.stat().st_size / (1024 * 1024)
-        print(
-            f"  Saved {filename.name} ({file_size_mb:.1f} MB, "
-            f"{len(trajectory)} steps, {elapsed:.0f}s)"
-        )
+        if save_json:
+            file_size_mb = filename.stat().st_size / (1024 * 1024)
+            print(
+                f"  Saved {filename.name} ({file_size_mb:.1f} MB, "
+                f"{len(trajectory)} steps, {elapsed:.0f}s)"
+            )
+        else:
+            print(f"  Episode {i} finished ({len(trajectory)} steps, {elapsed:.0f}s)")
         if replay_info.get("local_copy"):
             print(f"  Replay copied to {Path(replay_info['local_copy']).name}")
         elif replay_info.get("path"):
@@ -661,6 +666,14 @@ def main():
         action="store_true",
         help="Print per-step progress",
     )
+    parser.add_argument(
+        "--save-json",
+        action="store_true",
+        help=(
+            "Also save per-episode trajectory JSON (can be very large). "
+            "Default is replay-only."
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -674,6 +687,7 @@ def main():
                 output_dir=args.output_dir,
                 verbose=args.verbose,
                 bot_type=args.bot,
+                save_json=args.save_json,
             )
         )
     except KeyboardInterrupt:
