@@ -55,6 +55,16 @@ To copy one out:
                                                                                                   ```      
 docker cp openra-rl-server:/root/.config/openra/Replays/ra/{DEV_VERSION}/<file>.orarep . 
 ```
+
+```
+cd C:\Users\huixu3\code\openrarl\OpenRA-RL\OpenRA                                                    
+.\launch-game.cmd Game.Mod=ra Launch.Replay="C:\full\path\to\your.orarep"
+.\launch-game.cmd Game.Mod=ra Launch.Replay="C:\Users\huixu3\code\openrarl\openra-rl-challenge\data\episodes\ra-RL-db15d685bc9d-2026-04-15T001937667Z.orarep" 
+
+New-Item -ItemType Directory -Force "$env:APPDATA\OpenRA\Replays\ra\{DEV_VERSION}" | Out-Null                                                                                          
+  Copy-Item "C:\Users\huixu3\code\openrarl\openra-rl-challenge\data\episodes\ra-RL-db15d685bc9d-2026-04-15T001937667Z.orarep" "$env:APPDATA\OpenRA\Replays\ra\{DEV_VERSION}\" 
+```
+
 ### Train (optional)
 
 ```bash
