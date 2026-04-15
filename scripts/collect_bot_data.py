@@ -48,9 +48,6 @@ from openra_env.models import OpenRAAction, OpenRAObservation, CommandModel, Act
 from scripted_bot import ScriptedBot
 from normal_ai_bot import NormalAIBot
 
-GAME_STATE_POLL_EVERY_STEPS = 25
-
-
 class PeriodicAttackBot(ScriptedBot):
     """ScriptedBot with grid-search targeting that works on any map layout.
 
@@ -313,44 +310,6 @@ def infer_outcome(
     return "step_limit"
 
 
-async def poll_terminal_game_state(env: OpenRAEnv) -> dict:
-    """Query the server-side game-state tool and normalize terminal fields."""
-    try:
-        state = await asyncio.wait_for(env.call_tool("get_game_state"), timeout=5.0)
-    except Exception:
-        return {}
-
-    if not isinstance(state, dict):
-        return {}
-
-    phase = str(state.get("phase", "") or "")
-    winner = str(state.get("winner", "") or "")
-    self_slot = str(state.get("self_slot", "") or "")
-    enemy_slot = str(state.get("enemy_slot", "") or "")
-    result = str(state.get("result", "") or "")
-
-    if phase != "game_over":
-        return {}
-
-    if not result:
-        if winner and self_slot and winner == self_slot:
-            result = "win"
-        elif winner and enemy_slot and winner == enemy_slot:
-            result = "lose"
-        elif winner:
-            result = "draw"
-        else:
-            result = "draw"
-
-    return {
-        "phase": phase,
-        "winner": winner,
-        "self_slot": self_slot,
-        "enemy_slot": enemy_slot,
-        "result": result,
-    }
-
-
 async def collect_episode(
     env_url: str,
     episode_id: int,
@@ -383,8 +342,6 @@ async def collect_episode(
     eliminated_since_step = None
     result = None
     obs = None
-    terminal_game_state: dict = {}
-
     async with OpenRAEnv(base_url=env_url, message_timeout_s=300.0) as env:
         if verbose:
             print(f"  Episode {episode_id}: Resetting environment (map={map_name})...")
@@ -458,16 +415,6 @@ async def collect_episode(
                         "done": result.done,
                     })
 
-                    if not result.done and step % GAME_STATE_POLL_EVERY_STEPS == 0:
-                        terminal_game_state = await poll_terminal_game_state(env)
-                        if terminal_game_state:
-                            if verbose:
-                                print(
-                                    f"  Episode {episode_id}: Game over via bridge state "
-                                    f"(winner={terminal_game_state['winner'] or '?'}, "
-                                    f"result={terminal_game_state['result']}), stopping."
-                                )
-                            break
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
                     if verbose:
@@ -512,7 +459,7 @@ async def collect_episode(
             error = "KeyboardInterrupt"
         finally:
             # If we stopped due to time/step limits, surrender to force a game-over so a replay is written.
-            if result is not None and not result.done and not terminal_game_state:
+            if result is not None and not result.done:
                 try:
                     await asyncio.wait_for(env.call_tool("surrender"), timeout=30.0)
                 except Exception:
@@ -526,9 +473,6 @@ async def collect_episode(
         # Record the final observation (no action taken, so reward=0)
         final_obs = result.observation if result is not None else obs
         if final_obs is not None:
-            if terminal_game_state:
-                final_obs.done = True
-                final_obs.result = terminal_game_state["result"]
             trajectory.append({
                 "step": step,
                 "observation": serialize_obs(final_obs),
