@@ -429,6 +429,7 @@ async def collect_episode(
                     elapsed_min = (time.time() - episode_start) / 60.0
                     credits = available_credits(result.observation)
                     attack_stats = bot.get_attack_stats(result.observation) if hasattr(bot, "get_attack_stats") else None
+                    squad_stats = bot.get_squad_stats() if hasattr(bot, "get_squad_stats") else None
                     attack_info = ""
                     if attack_stats is not None:
                         attack_info = (
@@ -443,6 +444,17 @@ async def collect_episode(
                         f"{bot.phase} | {elapsed_min:.1f}min"
                         f"{attack_info}"
                     )
+                    if squad_stats is not None:
+                        states = squad_stats.get("states", {})
+                        print(
+                            "    "
+                            f"Squads | idle:{squad_stats['idle_ground']} "
+                            f"atk:{squad_stats['attack_squad']} "
+                            f"rush:{squad_stats['rush_squad']} "
+                            f"prot:{squad_stats['protection_squad']} "
+                            f"thr:{squad_stats['assault_threshold']} "
+                            f"state:{states}"
+                        )
 
         except KeyboardInterrupt:
             error = "KeyboardInterrupt"

@@ -434,6 +434,9 @@ class NormalAIBot:
         self._squad_state_until: dict[str, int] = {}
         self._squad_regroup_count: dict[str, int] = {}
         self._squad_last_commit_tick: dict[str, int] = {}
+        self._squad_target_actor_id: dict[str, int] = {}
+        self._squad_target_kind: dict[str, str] = {}
+        self._squad_target_point: dict[str, Tuple[int, int]] = {}
         self._enemy_base_pos: Optional[Tuple[int, int]] = None
         # Bridge only exposes currently visible enemies; keep a short-lived memory.
         self._last_seen_enemy_pos: Optional[Tuple[int, int]] = None
@@ -1313,9 +1316,7 @@ class NormalAIBot:
                 self._rush_squad.extend(uid for uid in launched if uid not in existing_rush)
                 self._idle_ground_units = []
                 self._last_rush_tick = obs.tick
-                self._rush_target_pos = (target_x, target_y)
-                self._rush_target_actor_id = target_actor_id
-                self._rush_target_kind = target_kind
+                self._set_squad_target("rush", target_actor_id, target_x, target_y, target_kind)
                 self._enemy_base_pos = (target_x, target_y)
                 self._clear_search_target()
                 self._reset_stale_attack_target()
@@ -1468,6 +1469,13 @@ class NormalAIBot:
                 self._set_squad_state(squad_name, "commit")
                 focus_commands = self._focus_fire_commands(squad_units, priority_target)
                 if focus_commands:
+                    self._set_squad_target(
+                        squad_name,
+                        priority_target[0],
+                        priority_target[1],
+                        priority_target[2],
+                        priority_target[4],
+                    )
                     return focus_commands
 
         if state == "retreat":
@@ -1552,6 +1560,8 @@ class NormalAIBot:
             and not local_enemy_buildings
             and self._squad_is_stuck(obs, squad_name, leader, (tx, ty))
         ):
+            self._log(f"{squad_name.capitalize()} squad stuck near ({tx}, {ty}); clearing target and reevaluating")
+            self._clear_squad_target(squad_name)
             if squad_name == "rush" and self._rush_target_pos == (tx, ty):
                 self._rush_target_pos = None
                 self._rush_target_actor_id = 0
@@ -1559,10 +1569,14 @@ class NormalAIBot:
             if self._enemy_base_pos == (tx, ty):
                 self._enemy_base_pos = None
             if target_kind == "search":
-                tx, ty = self._advance_search_target(obs)
-                target_actor_id = 0
-                target_kind = "search"
+                self._clear_search_target()
             self._reset_stale_attack_target()
+            tx, ty, target_actor_id, target_kind = self._find_attack_target_info(
+                obs,
+                leader.cell_x,
+                leader.cell_y,
+                squad_name=squad_name,
+            )
         if squad_name in {"assault", "rush"}:
             self._track_stale_attack_target(obs, leader, tx, ty)
         if (force_commit or force_global) and squad_name == "assault":
@@ -1709,6 +1723,17 @@ class NormalAIBot:
         leader_y: Optional[int],
         squad_name: str = "assault",
     ) -> Tuple[int, int, int, str]:
+        current_target = self._get_visible_squad_target_info(obs, squad_name)
+        if current_target is not None:
+            tx, ty, target_actor_id, target_kind = current_target
+            if target_kind == "building":
+                self._enemy_base_pos = (tx, ty)
+            elif self._enemy_base_pos is None:
+                self._enemy_base_pos = (tx, ty)
+            self._clear_search_target()
+            self._reset_stale_attack_target()
+            return current_target
+
         if squad_name == "rush" and self._rush_target_pos is not None:
             if self._should_clear_point_target(obs, self._rush_target_pos, leader_x, leader_y):
                 self._log(f"Clearing stale rush target {self._rush_target_pos}")
@@ -1728,9 +1753,10 @@ class NormalAIBot:
                     self._rush_target_kind,
                 )
 
-        priority = self._pick_priority_target(obs, None, None, local_only=False, squad_name=squad_name)
-        if priority is not None:
-            actor_id, tx, ty, _, kind = priority
+        closest = self._pick_closest_visible_target(obs, leader_x, leader_y, squad_name=squad_name)
+        if closest is not None:
+            actor_id, tx, ty, _, kind = closest
+            self._set_squad_target(squad_name, actor_id, tx, ty, kind)
             if kind == "building":
                 self._enemy_base_pos = (tx, ty)
             elif self._enemy_base_pos is None:
@@ -1748,16 +1774,20 @@ class NormalAIBot:
             self._reset_stale_attack_target()
         if self._enemy_base_pos:
             self._clear_search_target()
+            self._set_squad_target(squad_name, 0, self._enemy_base_pos[0], self._enemy_base_pos[1], "point")
             return self._enemy_base_pos[0], self._enemy_base_pos[1], 0, "point"
 
         # If we don't have a persistent base target, prefer last-seen memory before blind exploration.
         if self._last_seen_base_pos is not None and obs.tick - self._last_seen_base_tick <= LAST_SEEN_BASE_TTL_TICKS:
             self._clear_search_target()
+            self._set_squad_target(squad_name, 0, self._last_seen_base_pos[0], self._last_seen_base_pos[1], "point")
             return self._last_seen_base_pos[0], self._last_seen_base_pos[1], 0, "point"
         if self._last_seen_enemy_pos is not None and obs.tick - self._last_seen_enemy_tick <= LAST_SEEN_ENEMY_TTL_TICKS:
             self._clear_search_target()
+            self._set_squad_target(squad_name, 0, self._last_seen_enemy_pos[0], self._last_seen_enemy_pos[1], "point")
             return self._last_seen_enemy_pos[0], self._last_seen_enemy_pos[1], 0, "point"
         tx, ty = self._select_search_target(obs, leader_x, leader_y)
+        self._set_squad_target(squad_name, 0, tx, ty, "search")
         return tx, ty, 0, "search"
 
     def _find_attack_target(
@@ -1864,6 +1894,65 @@ class NormalAIBot:
     def _clear_search_target(self) -> None:
         self._search_target = None
         self._search_target_started_tick = -9999
+
+    def _set_squad_target(
+        self,
+        squad_name: str,
+        target_actor_id: int,
+        tx: int,
+        ty: int,
+        target_kind: str,
+    ) -> None:
+        self._squad_target_point[squad_name] = (tx, ty)
+        if target_actor_id > 0 and target_kind in {"unit", "building"}:
+            self._squad_target_actor_id[squad_name] = target_actor_id
+            self._squad_target_kind[squad_name] = target_kind
+        else:
+            self._squad_target_actor_id.pop(squad_name, None)
+            self._squad_target_kind.pop(squad_name, None)
+
+        if squad_name == "rush":
+            self._rush_target_pos = (tx, ty)
+            self._rush_target_actor_id = target_actor_id if target_kind in {"unit", "building"} else 0
+            self._rush_target_kind = target_kind
+
+    def _clear_squad_target(self, squad_name: str) -> None:
+        self._squad_target_actor_id.pop(squad_name, None)
+        self._squad_target_kind.pop(squad_name, None)
+        self._squad_target_point.pop(squad_name, None)
+        if squad_name == "rush":
+            self._rush_target_pos = None
+            self._rush_target_actor_id = 0
+            self._rush_target_kind = "point"
+
+    def _visible_actor_by_target(
+        self,
+        obs: OpenRAObservation,
+        target_actor_id: int,
+        target_kind: str,
+    ):
+        if target_actor_id <= 0:
+            return None
+        if target_kind == "unit":
+            return next((enemy for enemy in obs.visible_enemies if enemy.actor_id == target_actor_id), None)
+        if target_kind == "building":
+            return next((building for building in obs.visible_enemy_buildings if building.actor_id == target_actor_id), None)
+        return None
+
+    def _get_visible_squad_target_info(
+        self,
+        obs: OpenRAObservation,
+        squad_name: str,
+    ) -> Optional[Tuple[int, int, int, str]]:
+        target_actor_id = self._squad_target_actor_id.get(squad_name, 0)
+        target_kind = self._squad_target_kind.get(squad_name, "point")
+        actor = self._visible_actor_by_target(obs, target_actor_id, target_kind)
+        if actor is None:
+            return None
+
+        tx, ty = self._actor_cell(actor)
+        self._squad_target_point[squad_name] = (tx, ty)
+        return tx, ty, target_actor_id, target_kind
 
     def _advance_search_target(self, obs: OpenRAObservation) -> Tuple[int, int]:
         if not self._candidate_targets:
@@ -2094,6 +2183,21 @@ class NormalAIBot:
             for squad_name, target in self._squad_last_target_point.items()
             if squad_name in self._squad_states
         }
+        self._squad_target_actor_id = {
+            squad_name: actor_id
+            for squad_name, actor_id in self._squad_target_actor_id.items()
+            if squad_name in self._squad_states
+        }
+        self._squad_target_kind = {
+            squad_name: kind
+            for squad_name, kind in self._squad_target_kind.items()
+            if squad_name in self._squad_states
+        }
+        self._squad_target_point = {
+            squad_name: point
+            for squad_name, point in self._squad_target_point.items()
+            if squad_name in self._squad_states
+        }
         self._previous_unit_hp = {
             actor_id: hp
             for actor_id, hp in self._previous_unit_hp.items()
@@ -2159,9 +2263,9 @@ class NormalAIBot:
             if obs.tick - tick <= BASE_ATTACK_MEMORY_TICKS
         ]
         if not self._rush_squad:
-            self._rush_target_pos = None
-            self._rush_target_actor_id = 0
-            self._rush_target_kind = "point"
+            self._clear_squad_target("rush")
+        if not self._attack_squad:
+            self._clear_squad_target("assault")
 
     def _update_damage_memory(self, obs: OpenRAObservation):
         self._recent_attack_points = [
@@ -4252,19 +4356,78 @@ class NormalAIBot:
 
         return best[1] if best is not None else None
 
+    def _pick_closest_visible_target(
+        self,
+        obs: OpenRAObservation,
+        x: Optional[int],
+        y: Optional[int],
+        squad_name: str = "assault",
+    ) -> Optional[Tuple[int, int, int, str, str]]:
+        if x is None or y is None:
+            return self._pick_priority_target(obs, x, y, local_only=False, squad_name=squad_name)
+
+        best: Optional[Tuple[tuple[int, int, int], Tuple[int, int, int, str, str]]] = None
+
+        for b in obs.visible_enemy_buildings:
+            priority = TARGET_BUILDING_PRIORITY.get(b.type, 40)
+            if squad_name == "protection":
+                priority += 8 if b.type in DEFENSE_STRUCTURE_TYPES else -12
+            elif squad_name == "rush" and b.type in {"proc", "weap", "fact", "powr", "apwr"}:
+                priority += 12
+            elif squad_name == "air":
+                if b.type in {"proc", "weap", "fact", "powr", "apwr", "hpad", "afld", "afld.ukraine"}:
+                    priority += 14
+                if b.type in {"sam", "agun", "tsla"}:
+                    priority -= 25
+            elif squad_name == "naval":
+                if b.type in NAVAL_STRUCTURE_TYPES | {"proc", "weap"}:
+                    priority += 10
+                if b.type in {"sam", "agun", "tsla"}:
+                    priority -= 10
+
+            dist = self._cell_distance(x, y, b.cell_x, b.cell_y)
+            key = (dist, -priority, -int((1.0 - b.hp_percent) * 100))
+            candidate = (b.actor_id, b.cell_x, b.cell_y, b.type, "building")
+            if best is None or key < best[0]:
+                best = (key, candidate)
+
+        for e in obs.visible_enemies:
+            if "husk" in e.type:
+                continue
+            if not e.can_attack and e.type not in {"harv", "mcv"} and squad_name not in {"rush", "air"}:
+                continue
+
+            priority = TARGET_UNIT_PRIORITY.get(e.type, 30 if e.can_attack else 10)
+            if squad_name == "protection":
+                if e.can_attack:
+                    priority += 15
+                if e.type in {"harv", "mcv"}:
+                    priority -= 20
+            elif squad_name == "rush" and e.type in {"harv", "mcv", "arty", "v2rl"}:
+                priority += 10
+            elif squad_name == "air" and e.type in {"harv", "mcv", "arty", "v2rl", "ftrk"}:
+                priority += 14
+            elif squad_name == "naval":
+                if e.type in SHIP_TYPES:
+                    priority += 18
+                elif e.type in AIRCRAFT_TYPES:
+                    priority -= 10
+
+            dist = self._cell_distance(x, y, e.cell_x, e.cell_y)
+            key = (dist, -priority, -int((1.0 - e.hp_percent) * 100))
+            candidate = (e.actor_id, e.cell_x, e.cell_y, e.type, "unit")
+            if best is None or key < best[0]:
+                best = (key, candidate)
+
+        return best[1] if best is not None else None
+
     def _target_actor_is_visible(
         self,
         obs: OpenRAObservation,
         target_actor_id: int,
         target_kind: str,
     ) -> bool:
-        if target_actor_id <= 0:
-            return False
-        if target_kind == "unit":
-            return any(enemy.actor_id == target_actor_id for enemy in obs.visible_enemies)
-        if target_kind == "building":
-            return any(building.actor_id == target_actor_id for building in obs.visible_enemy_buildings)
-        return False
+        return self._visible_actor_by_target(obs, target_actor_id, target_kind) is not None
 
     def _focus_fire_commands(
         self,
@@ -4330,6 +4493,19 @@ class NormalAIBot:
             stats["units_killed"] = obs.military.units_killed
             stats["buildings_killed"] = obs.military.buildings_killed
         return stats
+
+    def get_squad_stats(self) -> dict[str, object]:
+        return {
+            "idle_ground": len(self._idle_ground_units),
+            "attack_squad": len(self._attack_squad),
+            "rush_squad": len(self._rush_squad),
+            "protection_squad": len(self._protection_squad),
+            "air_squad": len(self._air_squad),
+            "naval_squad": len(self._naval_squad),
+            "assault_threshold": self._assault_threshold,
+            "states": dict(self._squad_states),
+            "targets": {name: self._squad_target_point[name] for name in self._squad_target_point},
+        }
 
     def _retreat_squad_commands(
         self,
