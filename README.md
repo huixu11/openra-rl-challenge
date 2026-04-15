@@ -57,7 +57,10 @@ docker cp openra-rl-server:/root/.config/openra/Replays/ra/{DEV_VERSION}/<file>.
 ```
 
 ```
-cd C:\Users\huixu3\code\openrarl\OpenRA-RL\OpenRA                                                    
+cd C:\Users\huixu3\code\openrarl\OpenRA-RL\OpenRA
+$env:Path = "C:\Program Files\dotnet;$env:Path"
+.\make.cmd all
+                                                    
 .\launch-game.cmd Game.Mod=ra Launch.Replay="C:\full\path\to\your.orarep"
 .\launch-game.cmd Game.Mod=ra Launch.Replay="C:\Users\huixu3\code\openrarl\openra-rl-challenge\data\episodes\ra-RL-db15d685bc9d-2026-04-15T001937667Z.orarep" 
 
