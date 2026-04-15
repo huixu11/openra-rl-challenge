@@ -4,9 +4,9 @@ Training scripts for **OpenRA-RL** — an environment that lets AI agents play *
 
 ## Why not use the published Docker image?
 
-The published image (`ghcr.io/yxc20089/openra-rl:latest`) has a critical bug: the AI opponent never spawns, so every game is played against nobody and you get zero combat data. This repo includes two key files that fix this:
+The published image (`ghcr.io/yxc20089/openra-rl:latest`) has a critical bug: the AI opponent never spawns, so every game is played against nobody and you get zero combat data. This repo builds the server from source instead:
 
-- **`Dockerfile`** — Builds the game server from source, pinned to commit `2e26b31c0f28b75d140e11d9023b56b17715adea` that includes the AI bot spawn fix. It clones both the OpenRA C# engine and the OpenRA-RL Python server from GitHub automatically — no other repos needed.
+- **`Dockerfile`** — Builds the game server from source. It pins OpenRA to commit `8a5d224223e0498e006a7350a9767a87bd45a708` and clones the OpenRA-RL Python server from GitHub `main`. Rebuild with `--no-cache` when you need the latest merged OpenRA-RL changes.
 - **`scripts/scripted_bot.py`** — Vendored copy of the base `ScriptedBot` class from `OpenRA-RL/examples/`. This removes the need to have the `OpenRA-RL` repo cloned as a sibling directory. `collect_bot_data.py` imports it directly.
 
 See [Bugs Found & Fixed](#bugs-found--fixed) for the full list of 9 bugs fixed.
@@ -93,13 +93,13 @@ openra-rl-challenge/
 
 ## Bugs Found & Fixed
 
-The published Docker image (`ghcr.io/yxc20089/openra-rl:latest`) has bugs that prevent data collection. The `Dockerfile` and `collect_bot_data.py` in this repo contain all fixes. Using `docker build` from this repo is required.
+The published Docker image (`ghcr.io/yxc20089/openra-rl:latest`) has bugs that prevent data collection. The `Dockerfile` in this repo rebuilds against fixed OpenRA/OpenRA-RL sources, and `collect_bot_data.py` carries the collector-side fixes. Using `docker build` from this repo is required.
 
 ### Docker image bugs (fixed by the Dockerfile)
 
 | # | Bug | Root Cause | Fix |
 |---|-----|-----------|-----|
-| 1 | **AI opponent never spawns** (critical) | `OpenRA.Game.dll` is built from an old commit missing `spectate` and `slot_bot` lobby commands in `LoadMap`. The AI player slot is silently dropped. | Dockerfile pins OpenRA to commit `2e26b31c0f28b75d140e11d9023b56b17715adea` which includes fix `8c96a76b4c`. |
+| 1 | **AI opponent never spawns** (critical) | `OpenRA.Game.dll` is built from an old commit missing `spectate` and `slot_bot` lobby commands in `LoadMap`. The AI player slot is silently dropped. | Dockerfile pins OpenRA to commit `8a5d224223e0498e006a7350a9767a87bd45a708`, which includes the required bot-spawn fixes. |
 | 2 | **Invalid bot type** | `BOT_TYPE=hard` is passed directly to OpenRA, which only accepts `rush`/`normal`/`turtle`/`naval`. Unrecognized types are silently ignored. | Rebuilt image includes `BOT_TYPE_MAP` that translates `hard` -> `normal`. |
 
 ### Script bugs (fixed in `collect_bot_data.py`)
