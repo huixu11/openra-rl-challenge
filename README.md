@@ -23,7 +23,7 @@ git clone <this-repo>
 cd openra-rl-challenge
 
 # 1. Build the fixed game server image (~5 min first time, cached after)
-docker build -t openra-rl:local .
+docker build --no-cache -t openra-rl:local . 
 
 # 2. Start the server
 docker run -d -p 8000:8000 --name openra-rl-server -e BOT_TYPE=easy openra-rl:local
@@ -45,6 +45,16 @@ python scripts/collect_bot_data.py --episodes 10 --max-minutes 15 --bot normal -
 
 This uses `NormalAIBot` — a Python reimplementation of OpenRA's `ModularBot@NormalAI` with weighted unit production, dynamic base building, squad management, and economy logic ported from `ai.yaml`.
 
+## Replay file
+
+To find it in a running container:                                                                       
+                                                                                                  ```      
+docker exec openra-rl-server find /root/.config/openra/Replays/ra/{DEV_VERSION}  -name '*.orarep' -type f               
+```                                                                                                        
+To copy one out:
+                                                                                                  ```      
+docker cp openra-rl-server:/root/.config/openra/Replays/ra/{DEV_VERSION}/<file>.orarep . 
+```
 ### Train (optional)
 
 ```bash

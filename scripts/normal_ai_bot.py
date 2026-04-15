@@ -1569,16 +1569,27 @@ class NormalAIBot:
             attackers = squad_units
         else:
             attackers = self._attack_wave_units(obs, squad_units) if squad_name == "assault" else squad_units
+        direct_attack = self._target_actor_is_visible(obs, target_actor_id, target_kind)
         for unit in attackers:
+            if direct_attack and not unit.can_attack:
+                continue
             commands.append(CommandModel(
-                action=ActionType.ATTACK_MOVE,
+                action=ActionType.ATTACK if direct_attack else ActionType.ATTACK_MOVE,
                 actor_id=unit.actor_id,
+                target_actor_id=target_actor_id if direct_attack else 0,
                 target_x=tx,
                 target_y=ty,
             ))
-        if commands:
+        if commands and not direct_attack:
             self._record_attack_issue(
                 direct_attack=False,
+                command_count=len(commands),
+                target_actor_id=target_actor_id,
+                target_kind=target_kind,
+            )
+        elif commands:
+            self._record_attack_issue(
+                direct_attack=True,
                 command_count=len(commands),
                 target_actor_id=target_actor_id,
                 target_kind=target_kind,
@@ -1801,7 +1812,8 @@ class NormalAIBot:
     ) -> bool:
         if obs.visible_enemies or obs.visible_enemy_buildings:
             return False
-        if obs.tick - self._last_attack_tick < STALE_TARGET_CLEAR_INTERVAL:
+        recent_enemy_sighting_tick = max(self._last_seen_enemy_tick, self._last_seen_base_tick)
+        if obs.tick - recent_enemy_sighting_tick < STALE_TARGET_CLEAR_INTERVAL:
             return False
 
         tx, ty = target
@@ -4239,6 +4251,20 @@ class NormalAIBot:
                 best = (score, candidate)
 
         return best[1] if best is not None else None
+
+    def _target_actor_is_visible(
+        self,
+        obs: OpenRAObservation,
+        target_actor_id: int,
+        target_kind: str,
+    ) -> bool:
+        if target_actor_id <= 0:
+            return False
+        if target_kind == "unit":
+            return any(enemy.actor_id == target_actor_id for enemy in obs.visible_enemies)
+        if target_kind == "building":
+            return any(building.actor_id == target_actor_id for building in obs.visible_enemy_buildings)
+        return False
 
     def _focus_fire_commands(
         self,
