@@ -300,7 +300,7 @@ NEW_PRODUCTION_CHANCE = 50
 SILO_BUILD_THRESHOLD = 0.8
 PROTECT_UNIT_SCAN_RADIUS = 15
 PROTECTION_SCAN_RADIUS = 12
-PROTECTION_RESPONSE_COOLDOWN = 30
+PROTECTION_TARGET_BACKOFF_TICKS = 4
 REPAIR_ALL_BUILDINGS_COOLDOWN = 107
 REPAIR_REACTIVE_HP_THRESHOLD = 0.67
 POWER_TOGGLE_INTERVAL = 150
@@ -422,7 +422,7 @@ class NormalAIBot:
         self._last_attack_eval_tick = 0
         self._last_rush_tick = 0
         self._last_assign_tick = 0
-        self._last_protection_tick = -9999
+        self._protection_backoff = PROTECTION_TARGET_BACKOFF_TICKS
         self._assault_threshold = self._roll_assault_threshold()
         self._squad_states: dict[str, str] = {
             "assault": "assemble",
@@ -1284,20 +1284,6 @@ class NormalAIBot:
 
         self._idle_ground_units.extend(u.actor_id for u in unassigned_ground)
 
-        # Dedicate a small local defense group only when there is an actual base threat.
-        if self._base_under_pressure(obs) and self._idle_ground_units:
-            idle_units = [ground_by_id[uid] for uid in self._idle_ground_units if uid in ground_by_id]
-            if base_center is not None:
-                idle_units.sort(
-                    key=lambda u: self._cell_distance(u.cell_x, u.cell_y, base_center[0], base_center[1])
-                )
-            protection_count = min(len(idle_units), PROTECTION_SQUAD_MIN_SIZE)
-            self._protection_squad = [u.actor_id for u in idle_units[:protection_count]]
-            protection_ids = set(self._protection_squad)
-            self._idle_ground_units = [uid for uid in self._idle_ground_units if uid not in protection_ids]
-        else:
-            self._protection_squad = []
-
         # OpenRA keeps rush squads separate from assault squads and periodically
         # moves all idle base units into the rush squad when the rush trigger fires.
         total_ground_troops = len(self._idle_ground_units) + len(self._attack_squad) + len(self._rush_squad) + len(self._protection_squad)
@@ -1614,65 +1600,151 @@ class NormalAIBot:
             self._squad_last_commit_tick[squad_name] = obs.tick
         return commands
 
+    def _recruit_protection_units(
+        self,
+        obs: OpenRAObservation,
+        threat: UnitInfoModel,
+        needed: int,
+    ) -> list[UnitInfoModel]:
+        if needed <= 0:
+            return []
+
+        alive = {u.actor_id: u for u in obs.units}
+        candidates = [
+            alive[uid]
+            for uid in self._idle_ground_units
+            if uid in alive and alive[uid].can_attack and alive[uid].type not in AIRCRAFT_TYPES | SHIP_TYPES
+        ]
+        candidates.sort(
+            key=lambda u: (
+                self._cell_distance(u.cell_x, u.cell_y, threat.cell_x, threat.cell_y),
+                self._cell_distance(u.cell_x, u.cell_y, *(self._base_center(obs) or (u.cell_x, u.cell_y))),
+            )
+        )
+        selected = candidates[:needed]
+        if not selected:
+            return []
+
+        selected_ids = {u.actor_id for u in selected}
+        existing = set(self._protection_squad)
+        self._protection_squad.extend(uid for uid in selected_ids if uid not in existing)
+        self._idle_ground_units = [uid for uid in self._idle_ground_units if uid not in selected_ids]
+        return selected
+
+    def _random_own_building_cell(self, obs: OpenRAObservation) -> Optional[Tuple[int, int]]:
+        if not obs.buildings:
+            return self._base_center(obs)
+        building = random.choice(obs.buildings)
+        return self._actor_cell(building)
+
+    def _release_protection_squad(
+        self,
+        obs: OpenRAObservation,
+        squad_units: list[UnitInfoModel],
+        reason: str,
+    ) -> List[CommandModel]:
+        fallback = self._random_own_building_cell(obs)
+        commands: list[CommandModel] = []
+        if fallback is not None:
+            tx, ty = fallback
+            for unit in squad_units:
+                commands.append(CommandModel(
+                    action=ActionType.MOVE,
+                    actor_id=unit.actor_id,
+                    target_x=tx,
+                    target_y=ty,
+                ))
+        if squad_units:
+            self._log(f"Releasing protection squad ({reason})")
+        self._protection_squad = []
+        self._temporary_defenders = set()
+        self._clear_squad_target("protection")
+        self._set_squad_state("protection", "assemble")
+        self._protection_backoff = PROTECTION_TARGET_BACKOFF_TICKS
+        return commands
+
+    def _find_closest_protection_target(
+        self,
+        obs: OpenRAObservation,
+        leader: UnitInfoModel,
+    ) -> Optional[Tuple[int, int, int, str]]:
+        best: Optional[Tuple[tuple[int, int, int], Tuple[int, int, int, str]]] = None
+
+        for enemy in self._visible_enemy_units_near(obs, leader.cell_x, leader.cell_y, PROTECTION_SCAN_RADIUS):
+            dist = self._cell_distance(leader.cell_x, leader.cell_y, enemy.cell_x, enemy.cell_y)
+            priority = TARGET_UNIT_PRIORITY.get(enemy.type, 30 if enemy.can_attack else 10)
+            key = (dist, -priority, -int((1.0 - enemy.hp_percent) * 100))
+            candidate = (enemy.cell_x, enemy.cell_y, enemy.actor_id, "unit")
+            if best is None or key < best[0]:
+                best = (key, candidate)
+
+        for building in self._visible_enemy_buildings_near(obs, leader.cell_x, leader.cell_y, PROTECTION_SCAN_RADIUS):
+            dist = self._cell_distance(leader.cell_x, leader.cell_y, building.cell_x, building.cell_y)
+            priority = TARGET_BUILDING_PRIORITY.get(building.type, 40)
+            key = (dist, -priority, -int((1.0 - building.hp_percent) * 100))
+            candidate = (building.cell_x, building.cell_y, building.actor_id, "building")
+            if best is None or key < best[0]:
+                best = (key, candidate)
+
+        return best[1] if best is not None else None
+
     def _handle_defense(self, obs: OpenRAObservation) -> List[CommandModel]:
-        commands = []
-        protection_units = self._squad_units(obs, self._protection_squad)
-        if not protection_units:
-            self._set_squad_state("protection", "assemble")
-            return commands
-
         threat = next(iter(self._base_threat_enemies(obs)), None)
-        if not threat:
-            current_state = self._current_squad_state(obs, "protection")
-            if current_state in {"commit", "retreat"}:
-                self._set_squad_state("protection", "recover", obs.tick + SQUAD_RECOVER_HOLD_TICKS)
-            return self._assemble_squad_commands(obs, "protection", protection_units)
+        protection_units = self._squad_units(obs, self._protection_squad)
 
-        if obs.tick - self._last_protection_tick < PROTECTION_RESPONSE_COOLDOWN:
-            return commands
+        if threat is not None and len(protection_units) < PROTECTION_SQUAD_MIN_SIZE:
+            self._recruit_protection_units(obs, threat, PROTECTION_SQUAD_MIN_SIZE - len(protection_units))
+            protection_units = self._squad_units(obs, self._protection_squad)
 
-        self._last_protection_tick = obs.tick
+        if not protection_units:
+            self._clear_squad_target("protection")
+            self._set_squad_state("protection", "assemble")
+            self._protection_backoff = PROTECTION_TARGET_BACKOFF_TICKS
+            return []
+
+        leader = self._select_squad_leader(protection_units)
+        visible_target = self._get_visible_squad_target_info(obs, "protection")
+
+        if visible_target is not None:
+            tx, ty, target_actor_id, target_kind = visible_target
+            self._protection_backoff = PROTECTION_TARGET_BACKOFF_TICKS
+        else:
+            replacement = self._find_closest_protection_target(obs, leader)
+            if replacement is not None:
+                tx, ty, target_actor_id, target_kind = replacement
+                self._set_squad_target("protection", target_actor_id, tx, ty, target_kind)
+                self._protection_backoff = PROTECTION_TARGET_BACKOFF_TICKS
+            else:
+                target_point = self._squad_target_point.get("protection")
+                if target_point is None:
+                    return self._release_protection_squad(obs, protection_units, "no target")
+                if self._protection_backoff < 0:
+                    return self._release_protection_squad(obs, protection_units, "lost target")
+                tx, ty = target_point
+                target_actor_id = 0
+                target_kind = "point"
+                self._protection_backoff -= 1
+
         self._last_contact_tick = obs.tick
         self._set_squad_state("protection", "commit")
 
-        defenders = list(protection_units)
-        enemy_pressure = len(self._base_threat_enemies(obs))
-        defenders.extend(self._emergency_defense_units(obs, max(0, enemy_pressure - len(defenders))))
-
-        seen: set[int] = set()
-        unique_defenders: list[UnitInfoModel] = []
-        for defender in defenders:
-            if defender.actor_id in seen:
-                continue
-            seen.add(defender.actor_id)
-            unique_defenders.append(defender)
-
-        self._temporary_defenders = {defender.actor_id for defender in unique_defenders}
-
-        priority_target = self._pick_priority_target(
-            obs,
-            threat.cell_x,
-            threat.cell_y,
-            local_only=True,
-            squad_name="protection",
-        )
-        if priority_target is not None:
-            return self._focus_fire_commands(unique_defenders, priority_target)
-
-        for defender in unique_defenders:
+        commands: list[CommandModel] = []
+        for defender in protection_units:
             if not defender.can_attack:
                 continue
             commands.append(CommandModel(
                 action=ActionType.ATTACK_MOVE,
                 actor_id=defender.actor_id,
-                target_x=threat.cell_x, target_y=threat.cell_y,
+                target_x=tx,
+                target_y=ty,
             ))
+
         if commands:
             self._record_attack_issue(
                 direct_attack=False,
                 command_count=len(commands),
-                target_actor_id=threat.actor_id,
-                target_kind="unit",
+                target_actor_id=target_actor_id,
+                target_kind=target_kind,
             )
         return commands
 
