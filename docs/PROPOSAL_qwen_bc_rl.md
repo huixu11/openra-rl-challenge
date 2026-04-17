@@ -29,7 +29,7 @@ This is better than direct "LLM outputs every command from scratch" for three re
 
 ## Why Plain BC -> RL Is Not Enough
 
-The current raw-action setup in [scripts/train_raw_bc.py](/C:/Users/huixu3/code/openrarl/openra-rl-challenge/scripts/train_raw_bc.py) is a good baseline, but it has limits:
+The key problem with raw step-by-step command imitation is that it has limits:
 
 - it flattens observations into text, which is workable but lossy
 - it learns from every surviving action equally, even when many steps are low-information
@@ -42,11 +42,10 @@ The current reward helper in [rewards/shaped_reward.py](/C:/Users/huixu3/code/op
 
 Partially.
 
-The current trajectory JSON is good for:
+Historical full trajectory JSON is good for:
 
 - debugging and replay-forensics
-- building a first raw-action BC baseline
-- validating that collection logic matches what happened in game
+- validating that collection logic matched what happened in game
 
 It is **not** a good long-term primary training format if one episode is around 1 GB.
 
@@ -68,7 +67,7 @@ Use a three-tier dataset instead of storing everything in the same format.
 
 ### Tier 1: Full-fidelity audit set
 
-Keep a small set of full trajectory JSON episodes exactly as they are now.
+If you intentionally keep a debug archive, keep only a small set of full trajectory JSON episodes.
 
 Recommended size:
 
@@ -265,7 +264,7 @@ Later, add self-play only after the policy is stable against fixed opponents. Se
 
 ### Input representation
 
-Do not rely only on the current free-form prompt in `train_raw_bc.py`.
+Do not rely only on a free-form prompt template.
 
 Use a more stable prompt template with explicit sections:
 
@@ -285,14 +284,10 @@ If possible, add a compact machine-readable block after the natural-language sum
 
 Prefer macro actions over raw low-level actions.
 
-If you need compatibility with the current trajectories:
+Use the current trajectories as the source material for compact macro rows, not as the final training corpus.
 
-- first train a raw-action baseline using the existing script
-- then add an action abstraction pass that maps raw commands into macro labels
+That gives you a direct benchmark path:
 
-That gives you a direct benchmark:
-
-- raw BC baseline
 - macro BC model
 - macro BC + offline improvement
 - macro BC + RL
@@ -340,7 +335,6 @@ But only keep:
 
 That is enough to build:
 
-- a raw BC baseline
 - a macro dataset
 - a first offline evaluation split
 
@@ -379,7 +373,7 @@ For this repo, 1 GB per episode is too expensive to be the default BC corpus bec
 
 It becomes efficient if you change the corpus design:
 
-- full JSON for a small audit set
+- optional full JSON for a small audit set
 - replay for everything
 - compact event-sampled rows for BC
 
@@ -426,8 +420,8 @@ Add:
 
 Update:
 
-- [scripts/train_raw_bc.py](/C:/Users/huixu3/code/openrarl/openra-rl-challenge/scripts/train_raw_bc.py)
-  - keep it as the raw-action baseline
+- [scripts/train_bc_qwen.py](/C:/Users/huixu3/code/openrarl/openra-rl-challenge/scripts/train_bc_qwen.py)
+  - keep it focused on compact macro-policy BC
   - add episode-level validation split support
   - add sample weighting hooks
 
@@ -468,18 +462,17 @@ Mitigations:
 
 If you want the most practical plan for this repo, I recommend:
 
-1. Keep the current imitation trainer as a baseline.
-2. Build a macro-action dataset from the existing collected trajectories.
-3. Fine-tune a Qwen 3.5 model with LoRA on the macro dataset.
-4. Add offline weighted imitation or ranking before online RL.
-5. Run constrained online RL with shaped reward plus win/loss, anchored to the BC policy.
+1. Build a macro-action dataset from the existing collected trajectories.
+2. Fine-tune a Qwen 3.5 model with LoRA on the macro dataset.
+3. Add offline weighted imitation or ranking before online RL.
+4. Run constrained online RL with shaped reward plus win/loss, anchored to the BC policy.
 
 ## Success Criteria
 
 Phase 1 success:
 
 - model produces valid macro actions consistently
-- BC model beats the raw-action baseline on offline validation and live evaluation
+- BC model improves offline validation and live evaluation against scripted or heuristic baselines
 
 Phase 2 success:
 

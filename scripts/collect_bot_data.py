@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect expert demonstrations by running a bot against OpenRA's built-in AI.
+"""Collect compact macro-policy demonstrations against OpenRA's built-in AI.
 
 Supports two Python bots:
   - scripted: PeriodicAttackBot (simple build-order + periodic grid-search attack)
@@ -9,7 +9,7 @@ Usage:
     # Start the OpenRA-RL server first:
     docker run -p 8000:8000 openra-rl
 
-    # Collect with the default scripted bot:
+    # Collect a macro dataset with the default scripted bot:
     python scripts/collect_bot_data.py --episodes 10
 
     # Collect with the normal AI bot (mimics OpenRA's built-in normal AI):
@@ -19,16 +19,18 @@ Usage:
     python scripts/collect_bot_data.py --episodes 2 --max-minutes 2 --bot normal
 
 Output:
-    data/episodes/episode_001.json  — list of {observation, action, reward} dicts
-    data/episodes/episode_002.json
+    data/macro/macro_dataset.jsonl.gz  - compact macro-policy dataset
+    data/episodes/collection_summary.json
+    data/episodes/episode_001.orarep
     ...
 
 Notes:
-    - The server runs at ~23 steps/second, so 15 min ≈ 20,000 steps.
+    - The server runs at ~23 steps/second, so 15 min is about 20,000 steps.
     - The ScriptedBot builds a full base by ~1400 steps, then marches to the enemy.
       You need 10+ minutes to see actual combat on a 128x128 map.
     - Episodes stop early if the game ends (win/lose) before the time limit.
-    - explored_percent is not in the raw step() observation (computed by MCP tool only).
+    - The collector writes compact macro rows directly; it does not save raw
+      per-step trajectory JSON.
 """
 
 import argparse
@@ -43,6 +45,13 @@ from pathlib import Path
 # scripted_bot.py is vendored in this scripts/ directory
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from build_macro_dataset import (
+    build_row,
+    extract_macro_actions,
+    observation_signature,
+    should_keep_step,
+    summarize_observation,
+)
 from openra_env.client import OpenRAEnv
 from openra_env.models import OpenRAAction, OpenRAObservation, CommandModel, ActionType
 from scripted_bot import ScriptedBot
@@ -278,20 +287,15 @@ def copy_replay_artifact(replay_info: dict, output_dir: Path, episode_id: int) -
     return enriched
 
 
-def write_json_array_stream(path: Path, items: list[dict]) -> None:
-    """Write a JSON array incrementally to avoid huge peak memory/slow dumps.
+def open_dataset_writer(path: Path, append: bool):
+    """Open the compact macro dataset writer."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "at" if append else "wt"
+    if path.suffix == ".gz":
+        import gzip
 
-    This matters for long episodes where the trajectory can be >1GB.
-    """
-    with open(path, "w") as f:
-        f.write("[")
-        for i, item in enumerate(items):
-            if i:
-                f.write(",")
-            json.dump(item, f, separators=(",", ":"))
-            if i and i % 2000 == 0:
-                f.flush()
-        f.write("]")
+        return gzip.open(path, mode, encoding="utf-8")
+    return open(path, mode, encoding="utf-8")
 
 
 def infer_outcome(
@@ -318,8 +322,11 @@ async def collect_episode(
     map_name: str = "singles.oramap",
     verbose: bool = False,
     bot_type: str = "scripted",
+    sample_every: int = 12,
+    keep_state_changes: bool = False,
+    top_k_types: int = 12,
 ) -> dict:
-    """Play one full game and record the trajectory.
+    """Play one full game and record compact macro-policy rows.
 
     Stops when any of these conditions is met (in order):
       1. Game ends (win / lose)
@@ -327,13 +334,13 @@ async def collect_episode(
       3. Step count reaches max_steps (safety cap)
 
     Returns:
-        List of {observation, action, reward} dicts — one per game step.
+        Dict with compact macro rows plus replay and summary data.
     """
     if bot_type == "normal":
         bot = NormalAIBot(verbose=verbose)
     else:
         bot = PeriodicAttackBot(verbose=False)
-    trajectory = []
+    macro_candidates = []
     replay_info = {}
     error = ""
     max_seconds = max_minutes * 60.0
@@ -342,6 +349,7 @@ async def collect_episode(
     eliminated_since_step = None
     result = None
     obs = None
+    prev_sig = None
     async with OpenRAEnv(base_url=env_url, message_timeout_s=300.0) as env:
         if verbose:
             print(f"  Episode {episode_id}: Resetting environment (map={map_name})...")
@@ -357,7 +365,14 @@ async def collect_episode(
                 replay_info = await env.call_tool("get_replay_path")
             except Exception:
                 replay_info = {}
-            return {"trajectory": trajectory, "replay": replay_info, "error": error}
+            return {
+                "macro_rows": [],
+                "replay": replay_info,
+                "error": error,
+                "final_observation": {},
+                "step_count": 0,
+                "result": "",
+            }
 
         # Let the bot see the reset observation so _get_map_size can initialize
         # (the correct playable-area dimensions will be refined on later steps)
@@ -406,14 +421,31 @@ async def collect_episode(
                     result = await env.step(action)
                     step += 1
 
-                    # Record (s, a, r, done) where r is the reward from taking a in s
-                    trajectory.append({
+                    step_data = {
                         "step": step - 1,
                         "observation": serialize_obs(obs_before),
                         "action": serialize_action(action),
                         "reward": result.reward or 0.0,
                         "done": result.done,
-                    })
+                    }
+                    macros = extract_macro_actions(step_data["action"])
+                    reasons = should_keep_step(
+                        step_idx=step_data["step"],
+                        step_data=step_data,
+                        obs=step_data["observation"],
+                        macros=macros,
+                        prev_sig=prev_sig,
+                        sample_every=sample_every,
+                        keep_state_changes=keep_state_changes,
+                    )
+                    prev_sig = observation_signature(step_data["observation"])
+                    if reasons:
+                        macro_candidates.append({
+                            "step_data": step_data,
+                            "state_summary": summarize_observation(step_data["observation"], top_k=top_k_types),
+                            "macros": macros,
+                            "reasons": reasons,
+                        })
 
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
@@ -470,21 +502,57 @@ async def collect_episode(
         except Exception as replay_exc:
             replay_info = {"error": str(replay_exc)}
 
-        # Record the final observation (no action taken, so reward=0)
+        # Record the final observation as a terminal no-op example.
         final_obs = result.observation if result is not None else obs
         if final_obs is not None:
-            trajectory.append({
+            final_step_data = {
                 "step": step,
                 "observation": serialize_obs(final_obs),
                 "action": {"commands": [{"action": "no_op"}]},
                 "reward": 0.0,
                 "done": True,
-            })
+            }
+            final_macros = extract_macro_actions(final_step_data["action"])
+            final_reasons = should_keep_step(
+                step_idx=final_step_data["step"],
+                step_data=final_step_data,
+                obs=final_step_data["observation"],
+                macros=final_macros,
+                prev_sig=prev_sig,
+                sample_every=sample_every,
+                keep_state_changes=keep_state_changes,
+            )
+            if final_reasons:
+                macro_candidates.append({
+                    "step_data": final_step_data,
+                    "state_summary": summarize_observation(final_step_data["observation"], top_k=top_k_types),
+                    "macros": final_macros,
+                    "reasons": final_reasons,
+                })
+
+        outcome = ""
+        macro_rows = []
+        final_obs_dict = {}
+        if final_obs is not None:
+            elapsed_total_s = time.time() - episode_start
+            outcome = infer_outcome(final_obs, eliminated_since_step, elapsed_total_s, max_minutes)
+            final_obs_dict = serialize_obs(final_obs)
+            episode_name = f"episode_{episode_id:03d}"
+            macro_rows = [
+                build_row(
+                    episode_name=episode_name,
+                    episode_result=outcome,
+                    step_data=item["step_data"],
+                    state_summary=item["state_summary"],
+                    macros=item["macros"],
+                    reasons=item["reasons"],
+                    include_raw_action=False,
+                )
+                for item in macro_candidates
+            ]
 
         if verbose and final_obs is not None:
             mil = final_obs.military
-            elapsed_total_s = time.time() - episode_start
-            outcome = infer_outcome(final_obs, eliminated_since_step, elapsed_total_s, max_minutes)
             elapsed_total = elapsed_total_s / 60.0
             attack_stats = bot.get_attack_stats(final_obs) if hasattr(bot, "get_attack_stats") else None
             attack_info = ""
@@ -502,7 +570,14 @@ async def collect_episode(
                 f"{attack_info}"
             )
 
-    return {"trajectory": trajectory, "replay": replay_info, "error": error}
+    return {
+        "macro_rows": macro_rows,
+        "replay": replay_info,
+        "error": error,
+        "final_observation": final_obs_dict,
+        "step_count": step,
+        "result": outcome,
+    }
 
 
 async def collect_all(
@@ -512,90 +587,96 @@ async def collect_all(
     max_minutes: float,
     map_name: str,
     output_dir: Path,
+    dataset_path: Path,
     verbose: bool,
     bot_type: str = "scripted",
-    save_json: bool = False,
+    sample_every: int = 12,
+    keep_state_changes: bool = False,
+    top_k_types: int = 12,
+    append_dataset: bool = False,
 ):
     """Collect multiple episodes sequentially."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     summaries = []
+    total_rows_written = 0
 
-    for i in range(1, num_episodes + 1):
-        print(f"\n{'='*60}")
-        print(f"Collecting episode {i}/{num_episodes}")
-        print(f"{'='*60}")
+    with open_dataset_writer(dataset_path, append=append_dataset) as dataset_writer:
+        for i in range(1, num_episodes + 1):
+            print(f"\n{'='*60}")
+            print(f"Collecting episode {i}/{num_episodes}")
+            print(f"{'='*60}")
 
-        t0 = time.time()
-        try:
-            episode_data = await collect_episode(
-                env_url=env_url,
-                episode_id=i,
-                max_steps=max_steps,
-                max_minutes=max_minutes,
-                map_name=map_name,
-                verbose=verbose,
-                bot_type=bot_type,
-            )
-        except Exception as e:
-            print(f"  Episode {i} FAILED: {e}")
-            continue
+            t0 = time.time()
+            try:
+                episode_data = await collect_episode(
+                    env_url=env_url,
+                    episode_id=i,
+                    max_steps=max_steps,
+                    max_minutes=max_minutes,
+                    map_name=map_name,
+                    verbose=verbose,
+                    bot_type=bot_type,
+                    sample_every=sample_every,
+                    keep_state_changes=keep_state_changes,
+                    top_k_types=top_k_types,
+                )
+            except Exception as e:
+                print(f"  Episode {i} FAILED: {e}")
+                continue
 
-        elapsed = time.time() - t0
-        trajectory = episode_data.get("trajectory", [])
-        replay_info = copy_replay_artifact(episode_data.get("replay", {}), output_dir, i)
-        episode_error = episode_data.get("error", "")
+            elapsed = time.time() - t0
+            replay_info = copy_replay_artifact(episode_data.get("replay", {}), output_dir, i)
+            episode_error = episode_data.get("error", "")
+            macro_rows = episode_data.get("macro_rows", [])
+            final = episode_data.get("final_observation", {})
 
-        filename = output_dir / f"episode_{i:03d}.json"
-        if save_json:
-            # Save trajectory (streaming write helps for huge episodes)
-            write_json_array_stream(filename, trajectory)
+            for row in macro_rows:
+                dataset_writer.write(json.dumps(row, separators=(",", ":")) + "\n")
+            dataset_writer.flush()
+            total_rows_written += len(macro_rows)
 
-        # Compute summary
-        final = trajectory[-1]["observation"] if trajectory else {}
-        mil = final.get("military", {})
-        final_units = len(final.get("units", []))
-        final_buildings = len(final.get("buildings", []))
-        summary_result = final.get("result")
-        if not summary_result:
-            if final_units == 0 and final_buildings == 0:
-                summary_result = "eliminated"
-            elif elapsed >= max_minutes * 60.0:
-                summary_result = f"time_limit({max_minutes:.0f}min)"
-            else:
-                summary_result = "step_limit"
-        summary = {
-            "episode": i,
-            "steps": len(trajectory),
-            "ticks": final.get("tick", 0),
-            "result": summary_result,
-            "kills_cost": mil.get("kills_cost", 0),
-            "deaths_cost": mil.get("deaths_cost", 0),
-            "explored_percent": final.get("explored_percent", 0),
-            "final_buildings": final_buildings,
-            "final_units": final_units,
-            "elapsed_s": round(elapsed, 1),
-            "file": str(filename) if save_json else "",
-            "replay_path": replay_info.get("path", ""),
-            "replay_local_copy": replay_info.get("local_copy", ""),
-            "error": episode_error,
-        }
-        summaries.append(summary)
+            mil = final.get("military", {})
+            final_units = len(final.get("units", []))
+            final_buildings = len(final.get("buildings", []))
+            summary_result = episode_data.get("result") or final.get("result")
+            if not summary_result:
+                if final_units == 0 and final_buildings == 0:
+                    summary_result = "eliminated"
+                elif elapsed >= max_minutes * 60.0:
+                    summary_result = f"time_limit({max_minutes:.0f}min)"
+                else:
+                    summary_result = "step_limit"
+            summary = {
+                "episode": i,
+                "steps": episode_data.get("step_count", 0),
+                "macro_rows": len(macro_rows),
+                "ticks": final.get("tick", 0),
+                "result": summary_result,
+                "kills_cost": mil.get("kills_cost", 0),
+                "deaths_cost": mil.get("deaths_cost", 0),
+                "explored_percent": final.get("explored_percent", 0),
+                "final_buildings": final_buildings,
+                "final_units": final_units,
+                "elapsed_s": round(elapsed, 1),
+                "dataset_path": str(dataset_path),
+                "replay_path": replay_info.get("path", ""),
+                "replay_local_copy": replay_info.get("local_copy", ""),
+                "error": episode_error,
+            }
+            summaries.append(summary)
 
-        if save_json:
-            file_size_mb = filename.stat().st_size / (1024 * 1024)
             print(
-                f"  Saved {filename.name} ({file_size_mb:.1f} MB, "
-                f"{len(trajectory)} steps, {elapsed:.0f}s)"
+                f"  Episode {i} finished "
+                f"({episode_data.get('step_count', 0)} env steps, "
+                f"{len(macro_rows)} macro rows, {elapsed:.0f}s)"
             )
-        else:
-            print(f"  Episode {i} finished ({len(trajectory)} steps, {elapsed:.0f}s)")
-        if replay_info.get("local_copy"):
-            print(f"  Replay copied to {Path(replay_info['local_copy']).name}")
-        elif replay_info.get("path"):
-            print(f"  Replay available at {replay_info['path']}")
-        if episode_error:
-            print(f"  Episode {i} completed with error: {episode_error}")
+            if replay_info.get("local_copy"):
+                print(f"  Replay copied to {Path(replay_info['local_copy']).name}")
+            elif replay_info.get("path"):
+                print(f"  Replay available at {replay_info['path']}")
+            if episode_error:
+                print(f"  Episode {i} completed with error: {episode_error}")
 
     # Save collection summary
     summary_file = output_dir / "collection_summary.json"
@@ -604,17 +685,26 @@ async def collect_all(
 
     print(f"\n{'='*60}")
     print(f"Collection complete: {len(summaries)}/{num_episodes} episodes")
+    print(f"Macro dataset: {dataset_path}")
+    print(f"Macro rows written: {total_rows_written}")
     print(f"Summary: {summary_file}")
     print(f"{'='*60}")
 
+    if len(summaries) < 20 or total_rows_written < 20000:
+        print("Dataset status: TOO SMALL for a serious Colab run.")
+    elif len(summaries) < 50 or total_rows_written < 50000:
+        print("Dataset status: OK for a first experiment, but collect more if results are weak.")
+    else:
+        print("Dataset status: ENOUGH to start macro-policy BC training on Colab.")
+
     # Print results table
     if summaries:
-        print(f"\n{'Episode':>8} {'Result':>10} {'Steps':>6} {'Kills$':>8} {'Deaths$':>8} {'Bldgs':>6} {'Units':>6}")
-        print("-" * 62)
+        print(f"\n{'Episode':>8} {'Result':>18} {'Steps':>6} {'Rows':>6} {'Kills$':>8} {'Deaths$':>8} {'Bldgs':>6} {'Units':>6}")
+        print("-" * 78)
         for s in summaries:
             result_str = s['result'] if s['result'] else 'timeout'
             print(
-                f"{s['episode']:>8} {result_str:>10} {s['steps']:>6} "
+                f"{s['episode']:>8} {result_str:>18} {s['steps']:>6} {s['macro_rows']:>6} "
                 f"{s['kills_cost']:>8} {s['deaths_cost']:>8} "
                 f"{s['final_buildings']:>6} {s['final_units']:>6}"
             )
@@ -622,7 +712,7 @@ async def collect_all(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Collect ScriptedBot expert demonstrations for imitation learning"
+        description="Collect compact macro-policy demonstrations for behavior cloning"
     )
     parser.add_argument(
         "--url",
@@ -661,7 +751,13 @@ def main():
         "--output-dir",
         type=Path,
         default=Path("data/episodes"),
-        help="Output directory for trajectory files (default: data/episodes)",
+        help="Output directory for replays and collection summary (default: data/episodes)",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=Path,
+        default=Path("data/macro/macro_dataset.jsonl.gz"),
+        help="Compact macro dataset path (default: data/macro/macro_dataset.jsonl.gz)",
     )
     parser.add_argument(
         "--bot",
@@ -678,12 +774,26 @@ def main():
         help="Print per-step progress",
     )
     parser.add_argument(
-        "--save-json",
+        "--sample-every",
+        type=int,
+        default=12,
+        help="Keep every Nth step as a periodic macro snapshot (default: 12, 0 disables periodic sampling)",
+    )
+    parser.add_argument(
+        "--keep-state-changes",
         action="store_true",
-        help=(
-            "Also save per-episode trajectory JSON (can be very large). "
-            "Default is replay-only."
-        ),
+        help="Also keep steps where coarse unit/building/combat counts changed",
+    )
+    parser.add_argument(
+        "--top-k-types",
+        type=int,
+        default=12,
+        help="Maximum number of unit/building types to keep in summaries (default: 12)",
+    )
+    parser.add_argument(
+        "--append-dataset",
+        action="store_true",
+        help="Append new rows to an existing macro dataset instead of overwriting it",
     )
     args = parser.parse_args()
 
@@ -696,9 +806,13 @@ def main():
                 max_minutes=args.max_minutes,
                 map_name=args.map,
                 output_dir=args.output_dir,
+                dataset_path=args.dataset_path,
                 verbose=args.verbose,
                 bot_type=args.bot,
-                save_json=args.save_json,
+                sample_every=args.sample_every,
+                keep_state_changes=args.keep_state_changes,
+                top_k_types=args.top_k_types,
+                append_dataset=args.append_dataset,
             )
         )
     except KeyboardInterrupt:

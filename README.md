@@ -41,7 +41,7 @@ python -m venv .venv
 # source .venv/bin/activate
 pip install openra-rl
 
-# 5. Collect data
+# 5. Collect compact macro-policy data
 python scripts/collect_bot_data.py --episodes 10 --max-minutes 15 --bot normal --verbose
 ```
 
@@ -80,23 +80,9 @@ Copy-Item "C:\Users\huixu3\code\openrarl\openra-rl-challenge\data\episodes\ra-RL
 
 ## Train (optional)
 
-Raw-action BC baseline:
-
-```bash
-python scripts/train_raw_bc.py \
-    --data-dir data/episodes \
-    --model Qwen/Qwen3-4B \
-    --epochs 3 \
-    --output-dir checkpoints/openra-raw-bc
-```
-
 Macro-policy BC path:
 
 ```bash
-python scripts/build_macro_dataset.py \
-    --data-dir data/episodes \
-    --output-path data/macro/macro_dataset.jsonl.gz
-
 python scripts/train_bc_qwen.py \
     --data-path data/macro/macro_dataset.jsonl.gz \
     --model Qwen/Qwen3-4B \
@@ -104,7 +90,27 @@ python scripts/train_bc_qwen.py \
     --output-dir checkpoints/openra-bc-qwen
 ```
 
-Note: both training paths require collected `episode_*.json` files, so collect with `--save-json` when you need training data.
+The collector now writes `data/macro/macro_dataset.jsonl.gz` directly. Upload only that file to Colab / Google Drive for training.
+
+If you have older raw trajectory JSON from previous runs, you can still backfill a compact dataset with:
+
+```bash
+python scripts/build_macro_dataset.py \
+    --data-dir data/episodes \
+    --output-path data/macro/macro_dataset.jsonl.gz
+```
+
+Recommended starting scale for macro BC:
+
+- `50-100` collected episodes
+- at least `50k` compact macro rows for a first useful run
+- `100k+` compact macro rows for a more serious run
+
+If you only want the Colab path, the notebook is:
+
+```text
+notebooks/colab_train_bc.ipynb
+```
 
 ## Repo Structure
 
@@ -112,11 +118,10 @@ Note: both training paths require collected `episode_*.json` files, so collect w
 openra-rl-challenge/
 |-- Dockerfile                  # Builds the fixed game server image
 |-- scripts/
-|   |-- collect_bot_data.py     # Data collection (--bot scripted|normal)
+|   |-- collect_bot_data.py     # Direct macro-policy data collection (--bot scripted|normal)
 |   |-- scripted_bot.py         # Base ScriptedBot (vendored from OpenRA-RL)
 |   |-- normal_ai_bot.py        # NormalAIBot - Python port of OpenRA's normal AI
-|   |-- build_macro_dataset.py  # Compact macro-dataset builder from trajectory JSON
-|   |-- train_raw_bc.py         # Raw low-level action BC baseline
+|   |-- build_macro_dataset.py  # Backfill compact macro dataset from older trajectory JSON
 |   `-- train_bc_qwen.py        # Macro-policy BC trainer for Qwen
 |-- rewards/
 |   `-- shaped_reward.py        # Evaluation reward function
@@ -146,6 +151,8 @@ The published Docker image (`ghcr.io/yxc20089/openra-rl:latest`) has bugs that p
 | 7 | **Missing `done` flag in trajectory entries** | Added `"done": result.done` to every entry |
 | 8 | **Map dimensions wrong (128x128 vs 112x54)** - targets outside playable area | `_get_map_size` now updates cache when smaller dimensions are observed |
 | 9 | **Bot leaves enemy base after first contact** | Added `_enemy_base_pos` to remember and re-attack the discovered location |
+
+The current collector no longer saves those full trajectory JSON files by default. It writes compact macro-policy rows directly into the training dataset.
 
 ## License
 

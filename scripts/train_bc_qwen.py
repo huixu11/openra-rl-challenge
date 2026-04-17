@@ -3,7 +3,7 @@
 
 This is the macro-policy training path. It consumes the JSONL/JSONL.GZ output
 from `scripts/build_macro_dataset.py` instead of the raw step-by-step episode
-trajectory JSON used by `scripts/train_raw_bc.py`.
+trajectory JSON files directly.
 
 Typical usage:
     python scripts/train_bc_qwen.py \
@@ -12,8 +12,8 @@ Typical usage:
         --output-dir checkpoints/openra-bc-qwen
 
 Recommended workflow:
-    1. Collect a small audit set with `collect_bot_data.py --save-json`
-    2. Build the compact macro dataset with `build_macro_dataset.py`
+    1. Collect the compact macro dataset with `collect_bot_data.py`
+    2. Upload the compact dataset to Colab or use it locally
     3. Train this macro BC model
 """
 
