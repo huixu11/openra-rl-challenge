@@ -1005,11 +1005,7 @@ async def collect_all(
             }
             summaries.append(summary)
 
-            print(
-                f"  Episode {i} finished "
-                f"({episode_data.get('step_count', 0)} env steps, "
-                f"{len(macro_rows)} macro rows, {elapsed:.0f}s)"
-            )
+            print(f"  Episode {i} finished ({episode_data.get('step_count', 0)} steps, {elapsed:.0f}s)")
             if replay_info.get("local_copy"):
                 print(f"  Replay copied to {Path(replay_info['local_copy']).name}")
             elif replay_info.get("path"):
@@ -1024,26 +1020,17 @@ async def collect_all(
 
     print(f"\n{'='*60}")
     print(f"Collection complete: {len(summaries)}/{num_episodes} episodes")
-    print(f"Macro dataset: {dataset_path}")
-    print(f"Macro rows written: {total_rows_written}")
     print(f"Summary: {summary_file}")
     print(f"{'='*60}")
 
-    if len(summaries) < 20 or total_rows_written < 20000:
-        print("Dataset status: TOO SMALL for a serious Colab run.")
-    elif len(summaries) < 50 or total_rows_written < 50000:
-        print("Dataset status: OK for a first experiment, but collect more if results are weak.")
-    else:
-        print("Dataset status: ENOUGH to start macro-policy BC training on Colab.")
-
     # Print results table
     if summaries:
-        print(f"\n{'Episode':>8} {'Result':>18} {'Steps':>6} {'Rows':>6} {'Kills$':>8} {'Deaths$':>8} {'Bldgs':>6} {'Units':>6}")
-        print("-" * 78)
+        print(f"\n{'Episode':>8} {'Result':>10} {'Steps':>6} {'Kills$':>8} {'Deaths$':>8} {'Bldgs':>6} {'Units':>6}")
+        print("-" * 62)
         for s in summaries:
             result_str = s['result'] if s['result'] else 'timeout'
             print(
-                f"{s['episode']:>8} {result_str:>18} {s['steps']:>6} {s['macro_rows']:>6} "
+                f"{s['episode']:>8} {result_str:>10} {s['steps']:>6} "
                 f"{s['kills_cost']:>8} {s['deaths_cost']:>8} "
                 f"{s['final_buildings']:>6} {s['final_units']:>6}"
             )
