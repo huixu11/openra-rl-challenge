@@ -29,7 +29,7 @@ This is better than direct "LLM outputs every command from scratch" for three re
 
 ## Why Plain BC -> RL Is Not Enough
 
-The current imitation setup in [scripts/train_imitation.py](/C:/Users/huixu3/code/openrarl/openra-rl-challenge/scripts/train_imitation.py) is a good baseline, but it has limits:
+The current raw-action setup in [scripts/train_raw_bc.py](/C:/Users/huixu3/code/openrarl/openra-rl-challenge/scripts/train_raw_bc.py) is a good baseline, but it has limits:
 
 - it flattens observations into text, which is workable but lossy
 - it learns from every surviving action equally, even when many steps are low-information
@@ -265,7 +265,7 @@ Later, add self-play only after the policy is stable against fixed opponents. Se
 
 ### Input representation
 
-Do not rely only on the current free-form prompt in `train_imitation.py`.
+Do not rely only on the current free-form prompt in `train_raw_bc.py`.
 
 Use a more stable prompt template with explicit sections:
 
@@ -426,7 +426,7 @@ Add:
 
 Update:
 
-- [scripts/train_imitation.py](/C:/Users/huixu3/code/openrarl/openra-rl-challenge/scripts/train_imitation.py)
+- [scripts/train_raw_bc.py](/C:/Users/huixu3/code/openrarl/openra-rl-challenge/scripts/train_raw_bc.py)
   - keep it as the raw-action baseline
   - add episode-level validation split support
   - add sample weighting hooks

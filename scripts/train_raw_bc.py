@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Imitation learning: behavioral cloning on ScriptedBot demonstrations.
+"""Raw-action behavioral cloning baseline on collected trajectory JSON.
 
-Trains a small LLM to predict the ScriptedBot's actions given game observations,
-using TRL's SFTTrainer.
+This is the baseline trainer that learns to predict the original low-level
+command JSON from the step-by-step trajectory files written by
+`collect_bot_data.py --save-json`.
+
+For the main macro-policy path, use `scripts/train_bc_qwen.py` instead.
 
 Usage:
     # 1. First collect data:
-    python scripts/collect_bot_data.py --episodes 10
+    python scripts/collect_bot_data.py --episodes 10 --save-json
 
-    # 2. Train:
-    python scripts/train_imitation.py --data-dir data/episodes --model Qwen/Qwen3-4B
+    # 2. Train the raw-action BC baseline:
+    python scripts/train_raw_bc.py --data-dir data/episodes --model Qwen/Qwen3-4B
 
     # 3. Quick test with fewer episodes:
-    python scripts/train_imitation.py --data-dir data/episodes --max-episodes 3 --epochs 1
+    python scripts/train_raw_bc.py --data-dir data/episodes --max-episodes 3 --epochs 1
 """
 
 import argparse
@@ -277,7 +280,7 @@ def train(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train an LLM to imitate the ScriptedBot via behavioral cloning"
+        description="Train the raw-action behavioral cloning baseline from trajectory JSON"
     )
     parser.add_argument(
         "--data-dir",
@@ -293,8 +296,8 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("checkpoints/openra-il"),
-        help="Output directory for trained model (default: checkpoints/openra-il)",
+        default=Path("checkpoints/openra-raw-bc"),
+        help="Output directory for trained model (default: checkpoints/openra-raw-bc)",
     )
     parser.add_argument(
         "--max-episodes",

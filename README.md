@@ -2,14 +2,14 @@
 
 https://youtu.be/YaO-KyHiXfo
 
-Training scripts for **OpenRA-RL** — an environment that lets AI agents play *Command & Conquer: Red Alert*.
+Training scripts for **OpenRA-RL** - an environment that lets AI agents play *Command & Conquer: Red Alert*.
 
 ## Why not use the published Docker image?
 
 The published image (`ghcr.io/yxc20089/openra-rl:latest`) has a critical bug: the AI opponent never spawns, so every game is played against nobody and you get zero combat data. This repo builds the server from source instead:
 
-- **`Dockerfile`** — Builds the game server from source. It pins OpenRA to commit `8a5d224223e0498e006a7350a9767a87bd45a708` and clones the OpenRA-RL Python server from GitHub `main`. Rebuild with `--no-cache` when you need the latest merged OpenRA-RL changes.
-- **`scripts/scripted_bot.py`** — Vendored copy of the base `ScriptedBot` class from `OpenRA-RL/examples/`. This removes the need to have the `OpenRA-RL` repo cloned as a sibling directory. `collect_bot_data.py` imports it directly.
+- **`Dockerfile`** - Builds the game server from source. It pins OpenRA to commit `8a5d224223e0498e006a7350a9767a87bd45a708` and clones the OpenRA-RL Python server from GitHub `main`. Rebuild with `--no-cache` when you need the latest merged OpenRA-RL changes.
+- **`scripts/scripted_bot.py`** - Vendored copy of the base `ScriptedBot` class from `OpenRA-RL/examples/`. This removes the need to have the `OpenRA-RL` repo cloned as a sibling directory. `collect_bot_data.py` imports it directly.
 
 See [Bugs Found & Fixed](#bugs-found--fixed) for the full list of 9 bugs fixed.
 
@@ -25,7 +25,7 @@ git clone <this-repo>
 cd openra-rl-challenge
 
 # 1. Build the fixed game server image (~5 min first time, cached after)
-docker build --no-cache -t openra-rl:local . 
+docker build --no-cache -t openra-rl:local .
 
 # 2. Start the server
 docker run -d -p 8000:8000 --name openra-rl-server -e BOT_TYPE=easy openra-rl:local
@@ -45,55 +45,83 @@ pip install openra-rl
 python scripts/collect_bot_data.py --episodes 10 --max-minutes 15 --bot normal --verbose
 ```
 
-This uses `NormalAIBot` — a Python reimplementation of OpenRA's `ModularBot@NormalAI` with weighted unit production, dynamic base building, squad management, and economy logic ported from `ai.yaml`.
+This uses `NormalAIBot` - a Python reimplementation of OpenRA's `ModularBot@NormalAI` with weighted unit production, dynamic base building, squad management, and economy logic ported from `ai.yaml`.
 
 ## Replay file
 
-To find it in a running container:                                                                       
-                                                                                                  ```      
-docker exec openra-rl-server find /root/.config/openra/Replays/ra/{DEV_VERSION}  -name '*.orarep' -type f               
-```                                                                                                        
-To copy one out:
-                                                                                                  ```      
-docker cp openra-rl-server:/root/.config/openra/Replays/ra/{DEV_VERSION}/<file>.orarep . 
+To find it in a running container:
+
+```bash
+docker exec openra-rl-server find /root/.config/openra/Replays/ra/{DEV_VERSION} -name '*.orarep' -type f
 ```
 
+To copy one out:
+
+```bash
+docker cp openra-rl-server:/root/.config/openra/Replays/ra/{DEV_VERSION}/<file>.orarep .
 ```
+
+To build a local OpenRA checkout and open a replay:
+
+```powershell
 cd C:\Users\huixu3\code\openrarl\OpenRA-RL\OpenRA
 $env:Path = "C:\Program Files\dotnet;$env:Path"
 .\make.cmd all
-                                                    
-.\launch-game.cmd Game.Mod=ra Launch.Replay="C:\full\path\to\your.orarep"
-.\launch-game.cmd Game.Mod=ra Launch.Replay="C:\Users\huixu3\code\openrarl\openra-rl-challenge\data\episodes\ra-RL-db15d685bc9d-2026-04-15T001937667Z.orarep" 
 
-New-Item -ItemType Directory -Force "$env:APPDATA\OpenRA\Replays\ra\{DEV_VERSION}" | Out-Null                                                                                          
-  Copy-Item "C:\Users\huixu3\code\openrarl\openra-rl-challenge\data\episodes\ra-RL-db15d685bc9d-2026-04-15T001937667Z.orarep" "$env:APPDATA\OpenRA\Replays\ra\{DEV_VERSION}\" 
+.\launch-game.cmd Game.Mod=ra Launch.Replay="C:\full\path\to\your.orarep"
 ```
 
-### Train (optional)
+If you want the replay to live in the standard local replay folder:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:APPDATA\OpenRA\Replays\ra\{DEV_VERSION}" | Out-Null
+Copy-Item "C:\Users\huixu3\code\openrarl\openra-rl-challenge\data\episodes\ra-RL-db15d685bc9d-2026-04-15T001937667Z.orarep" "$env:APPDATA\OpenRA\Replays\ra\{DEV_VERSION}\"
+```
+
+## Train (optional)
+
+Raw-action BC baseline:
 
 ```bash
-python scripts/train_imitation.py \
+python scripts/train_raw_bc.py \
     --data-dir data/episodes \
     --model Qwen/Qwen3-4B \
     --epochs 3 \
-    --output-dir checkpoints/openra-il
+    --output-dir checkpoints/openra-raw-bc
 ```
+
+Macro-policy BC path:
+
+```bash
+python scripts/build_macro_dataset.py \
+    --data-dir data/episodes \
+    --output-path data/macro/macro_dataset.jsonl.gz
+
+python scripts/train_bc_qwen.py \
+    --data-path data/macro/macro_dataset.jsonl.gz \
+    --model Qwen/Qwen3-4B \
+    --epochs 3 \
+    --output-dir checkpoints/openra-bc-qwen
+```
+
+Note: both training paths require collected `episode_*.json` files, so collect with `--save-json` when you need training data.
 
 ## Repo Structure
 
-```
+```text
 openra-rl-challenge/
-├── Dockerfile                  # Builds the fixed game server image
-├── scripts/
-│   ├── collect_bot_data.py     # Data collection (--bot scripted|normal)
-│   ├── scripted_bot.py         # Base ScriptedBot (vendored from OpenRA-RL)
-│   ├── normal_ai_bot.py        # NormalAIBot — Python port of OpenRA's normal AI
-│   └── train_imitation.py      # Behavioral cloning trainer
-├── rewards/
-│   └── shaped_reward.py        # Evaluation reward function
-├── requirements.txt
-└── README.md
+|-- Dockerfile                  # Builds the fixed game server image
+|-- scripts/
+|   |-- collect_bot_data.py     # Data collection (--bot scripted|normal)
+|   |-- scripted_bot.py         # Base ScriptedBot (vendored from OpenRA-RL)
+|   |-- normal_ai_bot.py        # NormalAIBot - Python port of OpenRA's normal AI
+|   |-- build_macro_dataset.py  # Compact macro-dataset builder from trajectory JSON
+|   |-- train_raw_bc.py         # Raw low-level action BC baseline
+|   `-- train_bc_qwen.py        # Macro-policy BC trainer for Qwen
+|-- rewards/
+|   `-- shaped_reward.py        # Evaluation reward function
+|-- requirements.txt
+`-- README.md
 ```
 
 ## Bugs Found & Fixed
@@ -111,12 +139,12 @@ The published Docker image (`ghcr.io/yxc20089/openra-rl:latest`) has bugs that p
 
 | # | Bug | Fix |
 |---|-----|-----|
-| 3 | **Reward off-by-one** — each entry's reward came from the previous action | Reordered loop: capture obs/action, call `step()`, then record reward |
-| 4 | **Soviet barracks (`barr`) missing from rally points** — infantry don't rally | Override `_handle_rally_points` to include `barr` |
+| 3 | **Reward off-by-one** - each entry's reward came from the previous action | Reordered loop: capture obs/action, call `step()`, then record reward |
+| 4 | **Soviet barracks (`barr`) missing from rally points** - infantry don't rally | Override `_handle_rally_points` to include `barr` |
 | 5 | **Terminal entry duplicated last reward** | Set terminal entry reward to `0.0` |
 | 6 | **Summary shows empty string instead of "timeout"** | Changed `get("result", "timeout")` to `get("result") or "timeout"` |
 | 7 | **Missing `done` flag in trajectory entries** | Added `"done": result.done` to every entry |
-| 8 | **Map dimensions wrong (128x128 vs 112x54)** — targets outside playable area | `_get_map_size` now updates cache when smaller dimensions are observed |
+| 8 | **Map dimensions wrong (128x128 vs 112x54)** - targets outside playable area | `_get_map_size` now updates cache when smaller dimensions are observed |
 | 9 | **Bot leaves enemy base after first contact** | Added `_enemy_base_pos` to remember and re-attack the discovered location |
 
 ## License
