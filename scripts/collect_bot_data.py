@@ -39,23 +39,363 @@ import json
 import shutil
 import sys
 import time
+from collections import Counter
 from pathlib import Path
+from typing import Any
 
 # openra_env is installed via: pip install openra-rl
 # scripted_bot.py is vendored in this scripts/ directory
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from build_macro_dataset import (
-    build_row,
-    extract_macro_actions,
-    observation_signature,
-    should_keep_step,
-    summarize_observation,
-)
 from openra_env.client import OpenRAEnv
 from openra_env.models import OpenRAAction, OpenRAObservation, CommandModel, ActionType
 from scripted_bot import ScriptedBot
 from normal_ai_bot import NormalAIBot
+
+
+def get_nested(d: dict[str, Any], key: str, default: Any = None) -> Any:
+    value = d.get(key, default)
+    return value if value is not None else default
+
+
+def count_types(items: list[dict[str, Any]], key: str = "type", top_k: int = 12) -> dict[str, int]:
+    counts = Counter(str(item.get(key, "")) for item in items if item.get(key))
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:top_k]
+    return {name: count for name, count in ordered}
+
+
+def render_counts(counts: dict[str, int]) -> str:
+    if not counts:
+        return "none"
+    return ", ".join(f"{count}x {name}" for name, count in counts.items())
+
+
+def infer_phase(obs: dict[str, Any]) -> str:
+    if obs.get("done"):
+        return "terminal"
+
+    buildings = {b.get("type") for b in get_nested(obs, "buildings", []) if b.get("type")}
+    tick = int(obs.get("tick", 0) or 0)
+    visible_enemy_units = len(get_nested(obs, "visible_enemies", []))
+    visible_enemy_buildings = len(get_nested(obs, "visible_enemy_buildings", []))
+    military = get_nested(obs, "military", {})
+    combat_activity = sum(
+        int(get_nested(military, field, 0) or 0)
+        for field in ("units_killed", "buildings_killed", "units_lost", "buildings_lost")
+    )
+
+    if visible_enemy_units or visible_enemy_buildings:
+        return "combat"
+    if not buildings:
+        return "eliminated"
+    if tick < 3000 or "fact" not in buildings:
+        return "opening"
+    if not ({"tent", "barr"} & buildings) or "proc" not in buildings:
+        return "opening"
+    if tick < 12000 and combat_activity == 0:
+        return "build_up"
+    if tick >= 24000:
+        return "late_game"
+    return "mid_game"
+
+
+def summarize_observation(obs: dict[str, Any], top_k: int) -> dict[str, Any]:
+    eco = get_nested(obs, "economy", {})
+    units = get_nested(obs, "units", [])
+    buildings = get_nested(obs, "buildings", [])
+    enemies = get_nested(obs, "visible_enemies", [])
+    enemy_buildings = get_nested(obs, "visible_enemy_buildings", [])
+    production = get_nested(obs, "production", [])
+    available = get_nested(obs, "available_production", [])
+    military = get_nested(obs, "military", {})
+    map_info = get_nested(obs, "map_info", {})
+
+    idle_units = sum(1 for unit in units if unit.get("is_idle"))
+    power_balance = int(get_nested(eco, "power_provided", 0) or 0) - int(get_nested(eco, "power_drained", 0) or 0)
+
+    return {
+        "tick": int(obs.get("tick", 0) or 0),
+        "phase": infer_phase(obs),
+        "done": bool(obs.get("done", False)),
+        "result": str(obs.get("result", "") or ""),
+        "map": {
+            "name": str(get_nested(map_info, "map_name", "") or ""),
+            "width": int(get_nested(map_info, "width", 0) or 0),
+            "height": int(get_nested(map_info, "height", 0) or 0),
+        },
+        "economy": {
+            "cash": int(get_nested(eco, "cash", 0) or 0),
+            "ore": int(get_nested(eco, "ore", 0) or 0),
+            "credits": int(get_nested(eco, "cash", 0) or 0) + int(get_nested(eco, "ore", 0) or 0),
+            "power_balance": power_balance,
+            "harvesters": int(get_nested(eco, "harvester_count", 0) or 0),
+        },
+        "own": {
+            "units": len(units),
+            "idle_units": idle_units,
+            "unit_types": count_types(units, top_k=top_k),
+            "buildings": len(buildings),
+            "building_types": count_types(buildings, top_k=top_k),
+        },
+        "enemy": {
+            "visible_units": len(enemies),
+            "unit_types": count_types(enemies, top_k=top_k),
+            "visible_buildings": len(enemy_buildings),
+            "building_types": count_types(enemy_buildings, top_k=top_k),
+        },
+        "production": [
+            {
+                "item": str(p.get("item", "") or ""),
+                "progress": round(float(p.get("progress", 0.0) or 0.0), 3),
+                "remaining_ticks": int(p.get("remaining_ticks", 0) or 0),
+            }
+            for p in production[:8]
+            if p.get("item")
+        ],
+        "available_production": [str(item) for item in available[:20]],
+        "military": {
+            key: int(get_nested(military, key, 0) or 0)
+            for key in (
+                "units_killed",
+                "buildings_killed",
+                "units_lost",
+                "buildings_lost",
+                "kills_cost",
+                "deaths_cost",
+            )
+        },
+        "explored_percent": float(obs.get("explored_percent", 0.0) or 0.0),
+    }
+
+
+def summarize_command(cmd: dict[str, Any]) -> dict[str, Any]:
+    action = str(cmd.get("action", "no_op") or "no_op").lower()
+    macro: dict[str, Any] = {"intent": action, "count": 1}
+
+    item_type = cmd.get("item_type")
+    if item_type:
+        macro["item_type"] = str(item_type)
+
+    target_actor_id = int(cmd.get("target_actor_id", 0) or 0)
+    if target_actor_id:
+        macro["target_actor_id"] = target_actor_id
+
+    target_x = cmd.get("target_x")
+    target_y = cmd.get("target_y")
+    if target_x is not None or target_y is not None:
+        tx = int(target_x or 0)
+        ty = int(target_y or 0)
+        if tx or ty:
+            macro["target"] = {"x": tx, "y": ty}
+
+    queued = bool(cmd.get("queued", False))
+    if queued:
+        macro["queued"] = True
+
+    for extra_key in ("stance", "stance_type"):
+        extra_value = cmd.get(extra_key)
+        if extra_value not in (None, "", 0):
+            macro[extra_key] = extra_value
+
+    return macro
+
+
+def macro_signature(macro: dict[str, Any]) -> str:
+    payload = {k: v for k, v in macro.items() if k != "count"}
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def merge_macros(macros: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    index_by_sig: dict[str, int] = {}
+
+    for macro in macros:
+        sig = macro_signature(macro)
+        existing_idx = index_by_sig.get(sig)
+        if existing_idx is None:
+            index_by_sig[sig] = len(merged)
+            merged.append(dict(macro))
+        else:
+            merged[existing_idx]["count"] += int(macro.get("count", 1) or 1)
+
+    build_idx = next((i for i, item in enumerate(merged) if item.get("intent") == "build"), None)
+    place_idx = next((i for i, item in enumerate(merged) if item.get("intent") == "place_building"), None)
+    if build_idx is not None and place_idx is not None:
+        build_macro = merged[build_idx]
+        place_macro = merged[place_idx]
+        construct_macro: dict[str, Any] = {
+            "intent": "construct",
+            "count": min(int(build_macro.get("count", 1)), int(place_macro.get("count", 1))),
+        }
+        if "item_type" in build_macro:
+            construct_macro["item_type"] = build_macro["item_type"]
+        if "target" in place_macro:
+            construct_macro["target"] = place_macro["target"]
+
+        rebuilt: list[dict[str, Any]] = [construct_macro]
+        for idx, macro in enumerate(merged):
+            if idx not in (build_idx, place_idx):
+                rebuilt.append(macro)
+        merged = rebuilt
+
+    return merged
+
+
+def extract_macro_actions(action: dict[str, Any]) -> list[dict[str, Any]]:
+    commands = get_nested(action, "commands", [])
+    if not commands:
+        return [{"intent": "no_op", "count": 1}]
+    merged = merge_macros([summarize_command(cmd) for cmd in commands])
+    return merged or [{"intent": "no_op", "count": 1}]
+
+
+def primary_intent(macros: list[dict[str, Any]]) -> str:
+    intents = [str(m.get("intent", "no_op")) for m in macros]
+    if not intents:
+        return "no_op"
+    if len(set(intents)) == 1:
+        return intents[0]
+    if any(intent in {"attack", "attack_move"} for intent in intents):
+        return "combat_mixed"
+    if any(intent in {"construct", "build", "place_building"} for intent in intents):
+        return "base_mixed"
+    if any(intent == "train" for intent in intents):
+        return "production_mixed"
+    return "mixed"
+
+
+def observation_signature(obs: dict[str, Any]) -> tuple[Any, ...]:
+    military = get_nested(obs, "military", {})
+    return (
+        len(get_nested(obs, "units", [])),
+        len(get_nested(obs, "buildings", [])),
+        len(get_nested(obs, "visible_enemies", [])),
+        len(get_nested(obs, "visible_enemy_buildings", [])),
+        len(get_nested(obs, "production", [])),
+        int(get_nested(military, "units_killed", 0) or 0),
+        int(get_nested(military, "buildings_killed", 0) or 0),
+        int(get_nested(military, "units_lost", 0) or 0),
+        int(get_nested(military, "buildings_lost", 0) or 0),
+    )
+
+
+def is_wait_only(macros: list[dict[str, Any]]) -> bool:
+    return len(macros) == 1 and macros[0].get("intent") == "no_op"
+
+
+def render_prompt(summary: dict[str, Any]) -> str:
+    economy = summary["economy"]
+    own = summary["own"]
+    enemy = summary["enemy"]
+    military = summary["military"]
+
+    lines = [
+        "You are planning the next macro action for an OpenRA Red Alert bot.",
+        "Return a JSON array of compact macro actions.",
+        "",
+        f"[tick] {summary['tick']}",
+        f"[phase] {summary['phase']}",
+        (
+            "[economy] "
+            f"cash={economy['cash']} ore={economy['ore']} total={economy['credits']} "
+            f"power={economy['power_balance']:+d} harvesters={economy['harvesters']}"
+        ),
+        (
+            "[own] "
+            f"units={own['units']} idle={own['idle_units']} "
+            f"buildings={own['buildings']}"
+        ),
+        f"[own_units] {render_counts(own['unit_types'])}",
+        f"[own_buildings] {render_counts(own['building_types'])}",
+        (
+            "[enemy] "
+            f"visible_units={enemy['visible_units']} "
+            f"visible_buildings={enemy['visible_buildings']}"
+        ),
+        f"[enemy_units] {render_counts(enemy['unit_types'])}",
+        f"[enemy_buildings] {render_counts(enemy['building_types'])}",
+        (
+            "[combat] "
+            f"killed={military['units_killed']}u/{military['buildings_killed']}b "
+            f"lost={military['units_lost']}u/{military['buildings_lost']}b "
+            f"kills_cost={military['kills_cost']} deaths_cost={military['deaths_cost']}"
+        ),
+        (
+            "[production] "
+            + (
+                ", ".join(
+                    f"{item['item']}@{item['progress']:.0%}(~{item['remaining_ticks']}t)"
+                    for item in summary["production"]
+                )
+                if summary["production"]
+                else "idle"
+            )
+        ),
+        (
+            "[available] "
+            + (", ".join(summary["available_production"]) if summary["available_production"] else "none")
+        ),
+        f"[explored_percent] {summary['explored_percent']:.1f}",
+    ]
+    return "\n".join(lines)
+
+
+def should_keep_step(
+    step_idx: int,
+    step_data: dict[str, Any],
+    obs: dict[str, Any],
+    macros: list[dict[str, Any]],
+    prev_sig: tuple[Any, ...] | None,
+    sample_every: int,
+    keep_state_changes: bool,
+) -> list[str]:
+    reasons: list[str] = []
+
+    if step_idx == 0:
+        reasons.append("episode_start")
+    if step_data.get("done"):
+        reasons.append("terminal")
+    if sample_every > 0 and step_idx % sample_every == 0:
+        reasons.append("periodic")
+    if not is_wait_only(macros):
+        reasons.append("non_noop")
+    if get_nested(obs, "visible_enemies", []) or get_nested(obs, "visible_enemy_buildings", []):
+        reasons.append("enemy_visible")
+    if abs(float(step_data.get("reward", 0.0) or 0.0)) > 1e-9:
+        reasons.append("nonzero_reward")
+
+    if keep_state_changes:
+        current_sig = observation_signature(obs)
+        if prev_sig is not None and current_sig != prev_sig:
+            reasons.append("state_change")
+
+    return reasons
+
+
+def build_row(
+    episode_name: str,
+    episode_result: str,
+    step_data: dict[str, Any],
+    state_summary: dict[str, Any],
+    macros: list[dict[str, Any]],
+    reasons: list[str],
+) -> dict[str, Any]:
+    return {
+        "id": f"{episode_name}:{int(step_data.get('step', 0) or 0)}",
+        "episode": episode_name,
+        "step": int(step_data.get("step", 0) or 0),
+        "tick": state_summary["tick"],
+        "phase": state_summary["phase"],
+        "episode_result": episode_result,
+        "reward": float(step_data.get("reward", 0.0) or 0.0),
+        "done": bool(step_data.get("done", False)),
+        "selection_reason": reasons,
+        "primary_intent": primary_intent(macros),
+        "state": state_summary,
+        "macro_actions": macros,
+        "prompt": render_prompt(state_summary),
+        "completion": json.dumps(macros, separators=(",", ":")),
+    }
 
 class PeriodicAttackBot(ScriptedBot):
     """ScriptedBot with grid-search targeting that works on any map layout.
@@ -546,7 +886,6 @@ async def collect_episode(
                     state_summary=item["state_summary"],
                     macros=item["macros"],
                     reasons=item["reasons"],
-                    include_raw_action=False,
                 )
                 for item in macro_candidates
             ]

@@ -38,16 +38,17 @@ The key problem with raw step-by-step command imitation is that it has limits:
 
 The current reward helper in [rewards/shaped_reward.py](/C:/Users/huixu3/code/openrarl/openra-rl-challenge/rewards/shaped_reward.py) is also evaluation-oriented, not yet a robust training reward on its own.
 
-## Is The Current JSON Good Enough?
+## Is The Current Macro Dataset Good Enough?
 
-Partially.
+Yes, as the primary training artifact.
 
-Historical full trajectory JSON is good for:
+The compact macro dataset is good for:
 
-- debugging and replay-forensics
-- validating that collection logic matched what happened in game
+- behavior cloning
+- Colab-friendly storage and upload
+- filtering and episode-level evaluation
 
-It is **not** a good long-term primary training format if one episode is around 1 GB.
+The old full trajectory JSON format was **not** a good long-term primary training format if one episode was around 1 GB.
 
 Why it is inefficient:
 
@@ -58,31 +59,14 @@ Why it is inefficient:
 
 So the answer is:
 
-- **good enough for an audit set and baseline**
-- **not efficient enough for the main BC corpus**
+- **yes for the main BC corpus**
+- **no for old full step-by-step JSON as the main corpus**
 
 ## Recommended Data Strategy
 
-Use a three-tier dataset instead of storing everything in the same format.
+Use a two-tier dataset instead of storing everything in the same format.
 
-### Tier 1: Full-fidelity audit set
-
-If you intentionally keep a debug archive, keep only a small set of full trajectory JSON episodes.
-
-Recommended size:
-
-- `10-20` full episodes
-
-Purpose:
-
-- collector debugging
-- schema evolution
-- error analysis
-- replay-to-JSON alignment checks
-
-At 1 GB per episode, this is already enough to inspect failure modes without creating a storage problem.
-
-### Tier 2: Compact BC training set
+### Tier 1: Compact BC training set
 
 This should be the main supervised dataset.
 
@@ -116,7 +100,7 @@ Preferred formats:
 
 This is the dataset that should feed Qwen BC.
 
-### Tier 3: Replay archive
+### Tier 2: Replay archive
 
 Keep the `.orarep` replay for every episode even if you do not keep the full JSON.
 
@@ -154,7 +138,7 @@ This preserves the advantages of an LLM policy while shrinking the action space 
 
 #### Stage 0: Data audit and cleanup
 
-Before training, build a dataset audit pass over the collected `episode_*.json` files.
+Before training, build a dataset audit pass over the collected macro dataset rows.
 
 Goals:
 
@@ -284,7 +268,7 @@ If possible, add a compact machine-readable block after the natural-language sum
 
 Prefer macro actions over raw low-level actions.
 
-Use the current trajectories as the source material for compact macro rows, not as the final training corpus.
+Use the compact macro dataset as the final training corpus.
 
 That gives you a direct benchmark path:
 
@@ -328,11 +312,6 @@ For a first serious BC model, I recommend:
   - `25-50` scripted bot episodes
   - `25-50` normal bot episodes
 
-But only keep:
-
-- `10-20` episodes as full JSON
-- the rest as replay plus compact extracted training rows
-
 That is enough to build:
 
 - a macro dataset
@@ -371,11 +350,10 @@ For this repo, 1 GB per episode is too expensive to be the default BC corpus bec
 - most bytes are redundant
 - training signal per byte is poor
 
-It becomes efficient if you change the corpus design:
+It becomes efficient if you use:
 
-- optional full JSON for a small audit set
 - replay for everything
-- compact event-sampled rows for BC
+- compact macro rows for BC
 
 That is the right tradeoff.
 
@@ -413,7 +391,6 @@ Keep a fixed benchmark suite:
 Add:
 
 - `scripts/audit_dataset.py`
-- `scripts/build_macro_dataset.py`
 - `scripts/train_bc_qwen.py`
 - `scripts/eval_policy.py`
 - `docs/EXPERIMENT_PLAN_bc_rl.md`
@@ -462,7 +439,7 @@ Mitigations:
 
 If you want the most practical plan for this repo, I recommend:
 
-1. Build a macro-action dataset from the existing collected trajectories.
+1. Collect a macro-action dataset directly with `scripts/collect_bot_data.py`.
 2. Fine-tune a Qwen 3.5 model with LoRA on the macro dataset.
 3. Add offline weighted imitation or ranking before online RL.
 4. Run constrained online RL with shaped reward plus win/loss, anchored to the BC policy.

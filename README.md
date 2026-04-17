@@ -83,6 +83,11 @@ Copy-Item "C:\Users\huixu3\code\openrarl\openra-rl-challenge\data\episodes\ra-RL
 Macro-policy BC path:
 
 ```bash
+python scripts/collect_bot_data.py \
+    --episodes 50 \
+    --bot normal \
+    --dataset-path data/macro/macro_dataset.jsonl.gz
+
 python scripts/train_bc_qwen.py \
     --data-path data/macro/macro_dataset.jsonl.gz \
     --model Qwen/Qwen3-4B \
@@ -91,14 +96,6 @@ python scripts/train_bc_qwen.py \
 ```
 
 The collector now writes `data/macro/macro_dataset.jsonl.gz` directly. Upload only that file to Colab / Google Drive for training.
-
-If you have older raw trajectory JSON from previous runs, you can still backfill a compact dataset with:
-
-```bash
-python scripts/build_macro_dataset.py \
-    --data-dir data/episodes \
-    --output-path data/macro/macro_dataset.jsonl.gz
-```
 
 Recommended starting scale for macro BC:
 
@@ -121,7 +118,6 @@ openra-rl-challenge/
 |   |-- collect_bot_data.py     # Direct macro-policy data collection (--bot scripted|normal)
 |   |-- scripted_bot.py         # Base ScriptedBot (vendored from OpenRA-RL)
 |   |-- normal_ai_bot.py        # NormalAIBot - Python port of OpenRA's normal AI
-|   |-- build_macro_dataset.py  # Backfill compact macro dataset from older trajectory JSON
 |   `-- train_bc_qwen.py        # Macro-policy BC trainer for Qwen
 |-- rewards/
 |   `-- shaped_reward.py        # Evaluation reward function
@@ -152,7 +148,7 @@ The published Docker image (`ghcr.io/yxc20089/openra-rl:latest`) has bugs that p
 | 8 | **Map dimensions wrong (128x128 vs 112x54)** - targets outside playable area | `_get_map_size` now updates cache when smaller dimensions are observed |
 | 9 | **Bot leaves enemy base after first contact** | Added `_enemy_base_pos` to remember and re-attack the discovered location |
 
-The current collector no longer saves those full trajectory JSON files by default. It writes compact macro-policy rows directly into the training dataset.
+The collector writes compact macro-policy rows directly into the training dataset and does not save raw trajectory JSON.
 
 ## License
 

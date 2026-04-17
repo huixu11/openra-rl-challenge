@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Train a Qwen behavioral-cloning model on the compact macro dataset.
 
-This is the macro-policy training path. It consumes the JSONL/JSONL.GZ output
-from `scripts/build_macro_dataset.py` instead of the raw step-by-step episode
-trajectory JSON files directly.
+This is the macro-policy training path. It consumes the compact
+`macro_dataset.jsonl.gz` written directly by `scripts/collect_bot_data.py`.
 
 Typical usage:
     python scripts/train_bc_qwen.py \
@@ -42,7 +41,7 @@ def load_macro_rows(
     """Load macro dataset rows from JSONL / JSONL.GZ."""
     if not data_path.exists():
         print(f"Dataset not found: {data_path}")
-        print("Run scripts/build_macro_dataset.py first.")
+        print("Run scripts/collect_bot_data.py first to create macro_dataset.jsonl.gz.")
         sys.exit(1)
 
     rows: list[dict[str, Any]] = []
