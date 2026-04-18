@@ -62,6 +62,8 @@ SQUAD_SIZE_RANDOM_BONUS = 30
 EXCLUDE_FROM_SQUADS = {"harv", "mcv", "dog", "badr.bomber", "u2"}
 BARRACKS_TYPES = {"tent", "barr"}
 WAR_FACTORY_TYPES = {"weap"}
+PRODUCTION_BUILDING_TYPES = BARRACKS_TYPES | WAR_FACTORY_TYPES
+TECH_BUILDING_TYPES = {"dome", "atek", "stek", "fix", "afld", "afld.ukraine", "hpad"}
 POWER_DOWN_TYPES = {"dome", "tsla", "mslo", "agun", "sam"}
 PROTECTION_TYPES = {
     "harv", "mcv", "mslo", "gap", "spen", "syrd", "iron", "pdox", "tsla", "agun",
@@ -301,6 +303,7 @@ SILO_BUILD_THRESHOLD = 0.8
 PROTECT_UNIT_SCAN_RADIUS = 15
 PROTECTION_SCAN_RADIUS = 12
 PROTECTION_TARGET_BACKOFF_TICKS = 4
+HOME_BASE_THREAT_RADIUS = BASE_BUILD_MAX_RADIUS + PROTECTION_SCAN_RADIUS
 REPAIR_ALL_BUILDINGS_COOLDOWN = 107
 REPAIR_REACTIVE_HP_THRESHOLD = 0.67
 POWER_TOGGLE_INTERVAL = 150
@@ -310,14 +313,21 @@ LOCAL_FIGHT_RADIUS = 12
 RUSH_ATTACK_SCAN_RADIUS = 15
 RETREAT_HEALTH_THRESHOLD = 0.42
 MINIMUM_CONSTRUCTION_YARD_COUNT = 2
+ADDITIONAL_CONSTRUCTION_YARD_COUNT = 0
 BUILD_ADDITIONAL_MCV_CASH_AMOUNT = 5000
 SCAN_FOR_NEW_MCV_INTERVAL = 20
 BUILD_MCV_INTERVAL = 101
 MCV_MIN_DEPLOY_RADIUS = 2
+MCV_MAX_DEPLOY_RADIUS = 20
 MCV_TARGET_REACHED_RADIUS = 2
 MCV_TRY_MAINTAIN_RANGE = 8
 MCV_FRIENDLY_CONYARD_DISLIKE_RANGE = 14
 MCV_FRIENDLY_REFINERY_DISLIKE_RANGE = 14
+MCV_DEPLOY_OFFSET = (-1, -1)
+EXPANSION_TOLERATE_VALUES = (1, 2)
+FORCE_EXPANSION_TOLERATE_VALUES = (2, 3)
+CONYARD_UNDEPLOY_COOLDOWN = 80
+MCV_DEPLOY_COMMAND_COOLDOWN = 800
 HARVESTER_THREAT_RADIUS = 10
 HARVESTER_RETREAT_COOLDOWN = 120
 LOW_EFFECT_HARVESTER_SCAN_INTERVAL = 433
@@ -477,7 +487,9 @@ class NormalAIBot:
         self._unit_delay_until: dict[str, int] = {}
         self._last_mcv_scan_tick = -9999
         self._last_mcv_build_tick = -9999
+        self._last_conyard_undeploy_tick = -9999
         self._mcv_targets: dict[int, tuple[int, int]] = {}
+        self._mcv_deploy_until: dict[int, int] = {}
         self._harvester_retreat_until: dict[int, int] = {}
         self._harvester_recent_damage_until: dict[int, int] = {}
         self._harvester_reassign_until: dict[int, int] = {}
@@ -1176,26 +1188,57 @@ class NormalAIBot:
             return commands
 
         self._last_mcv_scan_tick = obs.tick
+        undeploy_command = self._maybe_undeploy_conyard_for_expansion(obs)
+        if undeploy_command is not None:
+            commands.append(undeploy_command)
+
         conyards = [b for b in obs.buildings if b.type == "fact"]
-        if len(conyards) >= MINIMUM_CONSTRUCTION_YARD_COUNT:
+        active_mcvs = [u for u in obs.units if u.type == "mcv"]
+        if len(conyards) >= MINIMUM_CONSTRUCTION_YARD_COUNT and not active_mcvs:
             return commands
 
-        for mcv in [u for u in obs.units if u.type == "mcv"]:
+        for mcv in active_mcvs:
+            if obs.tick < self._mcv_deploy_until.get(mcv.actor_id, -9999):
+                continue
+            target = self._mcv_targets.get(mcv.actor_id)
+            if target is not None and self._cell_distance(mcv.cell_x, mcv.cell_y, *target) <= MCV_TARGET_REACHED_RADIUS:
+                if self._can_mcv_deploy_at(obs, mcv.cell_x, mcv.cell_y):
+                    self._log(f"Deploying expansion MCV #{mcv.actor_id} at ({mcv.cell_x}, {mcv.cell_y})")
+                    self._mcv_deploy_until[mcv.actor_id] = obs.tick + MCV_DEPLOY_COMMAND_COOLDOWN
+                    commands.append(CommandModel(action=ActionType.DEPLOY, actor_id=mcv.actor_id))
+                    self._mcv_targets.pop(mcv.actor_id, None)
+                    continue
+                self._mcv_targets.pop(mcv.actor_id, None)
+                target = None
+
             if not mcv.is_idle:
                 continue
 
-            nearest_conyard = self._nearest_distance_to_buildings(mcv.cell_x, mcv.cell_y, conyards)
-            if nearest_conyard >= MCV_TRY_MAINTAIN_RANGE:
-                commands.append(CommandModel(action=ActionType.DEPLOY, actor_id=mcv.actor_id))
-                self._mcv_targets.pop(mcv.actor_id, None)
-                continue
-
-            target = self._mcv_targets.get(mcv.actor_id)
-            if target is None or self._cell_distance(mcv.cell_x, mcv.cell_y, *target) <= MCV_TARGET_REACHED_RADIUS:
-                target = self._pick_expansion_target(obs)
+            if target is None:
+                expansion_target = self._pick_expansion_target(obs)
+                if expansion_target is None:
+                    if self._can_mcv_deploy_at(obs, mcv.cell_x, mcv.cell_y):
+                        self._log(f"Deploying expansion MCV #{mcv.actor_id} at ({mcv.cell_x}, {mcv.cell_y})")
+                        self._mcv_deploy_until[mcv.actor_id] = obs.tick + MCV_DEPLOY_COMMAND_COOLDOWN
+                        commands.append(CommandModel(action=ActionType.DEPLOY, actor_id=mcv.actor_id))
+                    continue
+                target = self._best_mcv_deploy_target(obs, mcv, expansion_target)
                 if target is None:
+                    if self._can_mcv_deploy_at(obs, mcv.cell_x, mcv.cell_y):
+                        self._log(f"Deploying expansion MCV #{mcv.actor_id} at ({mcv.cell_x}, {mcv.cell_y})")
+                        self._mcv_deploy_until[mcv.actor_id] = obs.tick + MCV_DEPLOY_COMMAND_COOLDOWN
+                        commands.append(CommandModel(action=ActionType.DEPLOY, actor_id=mcv.actor_id))
                     continue
                 self._mcv_targets[mcv.actor_id] = target
+                self._log(f"Dispatching MCV #{mcv.actor_id} -> {target} for expansion {expansion_target}")
+
+            if self._cell_distance(mcv.cell_x, mcv.cell_y, *target) <= MCV_TARGET_REACHED_RADIUS:
+                if self._can_mcv_deploy_at(obs, mcv.cell_x, mcv.cell_y):
+                    self._log(f"Deploying expansion MCV #{mcv.actor_id} at ({mcv.cell_x}, {mcv.cell_y})")
+                    self._mcv_deploy_until[mcv.actor_id] = obs.tick + MCV_DEPLOY_COMMAND_COOLDOWN
+                    commands.append(CommandModel(action=ActionType.DEPLOY, actor_id=mcv.actor_id))
+                    self._mcv_targets.pop(mcv.actor_id, None)
+                continue
 
             commands.append(CommandModel(
                 action=ActionType.MOVE,
@@ -1682,7 +1725,9 @@ class NormalAIBot:
         candidates = [
             alive[uid]
             for uid in self._idle_ground_units
-            if uid in alive and alive[uid].can_attack and alive[uid].type not in AIRCRAFT_TYPES | SHIP_TYPES
+            if uid in alive
+            and alive[uid].can_attack
+            and alive[uid].type not in AIRCRAFT_TYPES | SHIP_TYPES
         ]
         candidates.sort(
             key=lambda u: (
@@ -2375,6 +2420,12 @@ class NormalAIBot:
             if actor_id in alive
         }
         alive_b = {b.actor_id for b in obs.buildings}
+        self._mcv_deploy_until = {
+            actor_id: tick
+            for actor_id, tick in self._mcv_deploy_until.items()
+            if actor_id in alive or actor_id in alive_b
+            if tick > obs.tick
+        }
         self._repair_issued &= alive_b
         self._reactive_repair_targets &= alive_b
         self._rally_set &= alive_b
@@ -2446,7 +2497,8 @@ class NormalAIBot:
             previous_hp = self._previous_building_hp.get(building.actor_id)
             if previous_hp is not None and building.hp_percent + 1e-6 < previous_hp:
                 bx, by = self._actor_cell(building)
-                self._remember_attack_point(bx, by, obs.tick)
+                if self._is_home_base_cell(obs, bx, by):
+                    self._remember_attack_point(bx, by, obs.tick)
                 if previous_hp >= REPAIR_REACTIVE_HP_THRESHOLD and building.hp_percent < REPAIR_REACTIVE_HP_THRESHOLD:
                     self._reactive_repair_targets.add(building.actor_id)
         self._previous_building_hp = next_building_hp
@@ -2456,7 +2508,9 @@ class NormalAIBot:
             next_unit_hp[unit.actor_id] = unit.hp_percent
             previous_hp = self._previous_unit_hp.get(unit.actor_id)
             if previous_hp is not None and unit.hp_percent + 1e-6 < previous_hp:
-                if unit.type in {"harv", "mcv"}:
+                if unit.type == "mcv" or (
+                    unit.type == "harv" and self._is_local_protection_asset(obs, unit.cell_x, unit.cell_y)
+                ):
                     self._remember_attack_point(unit.cell_x, unit.cell_y, obs.tick)
                 if unit.type == "harv":
                     self._harvester_recent_damage_until[unit.actor_id] = obs.tick + HARVESTER_RETREAT_COOLDOWN
@@ -2787,6 +2841,29 @@ class NormalAIBot:
             )
         return None
 
+    def _is_home_base_cell(self, obs: OpenRAObservation, x: int, y: int) -> bool:
+        base_center = self._base_center(obs)
+        return base_center is None or self._cell_distance(x, y, base_center[0], base_center[1]) <= HOME_BASE_THREAT_RADIUS
+
+    def _is_local_protection_asset(self, obs: OpenRAObservation, x: int, y: int) -> bool:
+        if self._is_home_base_cell(obs, x, y):
+            return True
+
+        anchors = [
+            b
+            for b in obs.buildings
+            if self._canonical_building_type(b.type) in {"fact", "proc"}
+            and self._is_home_base_cell(
+                obs,
+                b.cell_x if b.cell_x > 0 else b.pos_x // 1024,
+                b.cell_y if b.cell_y > 0 else b.pos_y // 1024,
+            )
+        ]
+        if anchors and self._nearest_distance_to_buildings(x, y, anchors) <= PROTECT_UNIT_SCAN_RADIUS:
+            return True
+
+        return False
+
     def _placement_base_center(self, obs: OpenRAObservation) -> Optional[Tuple[int, int]]:
         cy = self._find_building(obs, "fact")
         if cy is not None:
@@ -2801,9 +2878,11 @@ class NormalAIBot:
             if b.type in PROTECTION_TYPES:
                 bx = b.cell_x if b.cell_x > 0 else b.pos_x // 1024
                 by = b.cell_y if b.cell_y > 0 else b.pos_y // 1024
+                if not self._is_home_base_cell(obs, bx, by):
+                    continue
                 protected_points.append((bx, by, PROTECTION_SCAN_RADIUS))
         for u in obs.units:
-            if u.type in {"harv", "mcv"}:
+            if u.type in {"harv", "mcv"} and self._is_local_protection_asset(obs, u.cell_x, u.cell_y):
                 protected_points.append((u.cell_x, u.cell_y, PROTECT_UNIT_SCAN_RADIUS))
         return protected_points
 
@@ -3785,7 +3864,7 @@ class NormalAIBot:
         return max(MINIMUM_EXCESS_POWER, min(MAXIMUM_EXCESS_POWER, MINIMUM_EXCESS_POWER + bonus))
 
     def _has_any_production_building(self, obs: OpenRAObservation) -> bool:
-        return any(b.type in BARRACKS_TYPES | WAR_FACTORY_TYPES for b in obs.buildings)
+        return any(self._canonical_building_type(b.type) in PRODUCTION_BUILDING_TYPES for b in obs.buildings)
 
     def _optimal_refinery_count(self, obs: OpenRAObservation) -> int:
         target = INITIAL_MIN_REFINERY_COUNT
@@ -4070,32 +4149,141 @@ class NormalAIBot:
     def _ensure_mcv_requests(self, obs: OpenRAObservation):
         if self._in_recovery_mode(obs):
             return
-        if self._build_index < len(BUILD_ORDER):
-            return
-        if not any(b.type in WAR_FACTORY_TYPES for b in obs.buildings):
-            return
-        if self._available_credits(obs) < BUILD_ADDITIONAL_MCV_CASH_AMOUNT:
-            return
 
-        patch_states = self._resource_patch_states(obs)
-        viable_expansions = [
-            state
-            for state in patch_states
-            if int(state["threat"]) == 0
-            and float(state["depletion_ratio"]) < 0.8
-            and int(state["expansion_score"]) > 0
-        ]
-        if not viable_expansions:
-            return
-
-        conyards = sum(1 for b in obs.buildings if b.type == "fact")
         mcvs = sum(1 for u in obs.units if u.type == "mcv")
+        conyards = sum(1 for b in obs.buildings if b.type == "fact")
+        if (conyards <= 0 and mcvs > 1) or (conyards > 0 and mcvs > 0):
+            return
+
         pending = sum(1 for p in obs.production if p.item == "mcv") + self._requested_production_count("mcv")
-        best_expansion = max(viable_expansions, key=lambda state: int(state["expansion_score"]))
+        if conyards + mcvs + pending >= self._desired_mcv_count(obs):
+            return
+
+        if pending > 0:
+            return
+
+        self._request_unit_production("mcv")
+
+    def _desired_mcv_count(self, obs: OpenRAObservation) -> int:
+        if self._available_credits(obs) >= BUILD_ADDITIONAL_MCV_CASH_AMOUNT:
+            return MINIMUM_CONSTRUCTION_YARD_COUNT + ADDITIONAL_CONSTRUCTION_YARD_COUNT
+        return MINIMUM_CONSTRUCTION_YARD_COUNT
+
+    def _expansion_pressure(self, obs: OpenRAObservation) -> tuple[bool, bool]:
+        if self._pick_expansion_target(obs) is None:
+            return False, False
+
         refinery_count = sum(1 for b in obs.buildings if b.type == "proc")
-        if conyards + mcvs + pending < MINIMUM_CONSTRUCTION_YARD_COUNT:
-            if int(best_expansion["expansion_score"]) >= 250 and refinery_count >= max(2, min(3, int(best_expansion["capacity"]))):
-                self._request_unit_production("mcv")
+        production_count = sum(
+            1
+            for b in obs.buildings
+            if self._canonical_building_type(b.type) in PRODUCTION_BUILDING_TYPES
+        )
+        if refinery_count < INITIAL_MIN_REFINERY_COUNT + ADDITIONAL_MIN_REFINERY_COUNT or production_count <= 0:
+            return False, False
+
+        tech_count = sum(
+            1
+            for b in obs.buildings
+            if self._canonical_building_type(b.type) in TECH_BUILDING_TYPES
+        )
+        tolerate_on_cash = self._available_credits(obs) // 12000
+        expand_now = (
+            production_count
+            + tech_count
+            - random.choice(EXPANSION_TOLERATE_VALUES)
+            - tolerate_on_cash
+            >= refinery_count
+        )
+        force_undeploy_even_no_base = (
+            production_count
+            + tech_count
+            - random.choice(FORCE_EXPANSION_TOLERATE_VALUES)
+            - tolerate_on_cash
+            >= refinery_count
+        )
+        return expand_now, force_undeploy_even_no_base
+
+    def _maybe_undeploy_conyard_for_expansion(self, obs: OpenRAObservation) -> Optional[CommandModel]:
+        if obs.tick - self._last_conyard_undeploy_tick < CONYARD_UNDEPLOY_COOLDOWN:
+            return None
+        if any(u.type == "mcv" for u in obs.units):
+            return None
+
+        expand_now, force_undeploy_even_no_base = self._expansion_pressure(obs)
+        if not expand_now:
+            return None
+
+        expansion_target = self._pick_expansion_target(obs)
+        if expansion_target is None:
+            return None
+
+        conyards = [b for b in obs.buildings if b.type == "fact"]
+        if len(conyards) <= 1 and not force_undeploy_even_no_base:
+            return None
+
+        movable_conyards = [
+            b for b in conyards
+            if not (getattr(b, "is_producing", False) and getattr(b, "producing_item", "") == "proc")
+            and obs.tick >= self._mcv_deploy_until.get(b.actor_id, -9999)
+        ]
+        if not movable_conyards:
+            return None
+
+        movable_conyards.sort(
+            key=lambda b: (
+                self._cell_distance(
+                    b.cell_x if b.cell_x > 0 else b.pos_x // 1024,
+                    b.cell_y if b.cell_y > 0 else b.pos_y // 1024,
+                    expansion_target[0],
+                    expansion_target[1],
+                ),
+                b.actor_id,
+            )
+        )
+        conyard = movable_conyards[0]
+        self._last_conyard_undeploy_tick = obs.tick
+        self._mcv_deploy_until[conyard.actor_id] = obs.tick + MCV_DEPLOY_COMMAND_COOLDOWN
+        self._log(f"Undeploying conyard #{conyard.actor_id} for expansion -> {expansion_target}")
+        return CommandModel(action=ActionType.DEPLOY, actor_id=conyard.actor_id)
+
+    def _mcv_deploy_top_left(self, cell_x: int, cell_y: int) -> tuple[int, int]:
+        return cell_x + MCV_DEPLOY_OFFSET[0], cell_y + MCV_DEPLOY_OFFSET[1]
+
+    def _mcv_cell_for_top_left(self, top_left_x: int, top_left_y: int) -> tuple[int, int]:
+        return top_left_x - MCV_DEPLOY_OFFSET[0], top_left_y - MCV_DEPLOY_OFFSET[1]
+
+    def _can_mcv_deploy_at(self, obs: OpenRAObservation, cell_x: int, cell_y: int) -> bool:
+        top_left_x, top_left_y = self._mcv_deploy_top_left(cell_x, cell_y)
+        return self._candidate_fits_building_footprint(obs, "fact", top_left_x, top_left_y)
+
+    def _best_mcv_deploy_target(
+        self,
+        obs: OpenRAObservation,
+        mcv: UnitInfoModel,
+        expansion_target: Tuple[int, int],
+    ) -> Optional[Tuple[int, int]]:
+        candidates = self._placement_candidates(
+            obs,
+            "fact",
+            expansion_target[0],
+            expansion_target[1],
+            MCV_MIN_DEPLOY_RADIUS,
+            MCV_MAX_DEPLOY_RADIUS,
+        )
+        if not candidates:
+            return None
+
+        source = (mcv.cell_x, mcv.cell_y)
+        deploy_cells = [self._mcv_cell_for_top_left(x, y) for x, y in candidates]
+        deploy_cells.sort(
+            key=lambda cell: (
+                abs(self._cell_distance(cell[0], cell[1], expansion_target[0], expansion_target[1]) - MCV_TRY_MAINTAIN_RANGE),
+                self._cell_distance(cell[0], cell[1], source[0], source[1]),
+                self._cell_distance(cell[0], cell[1], expansion_target[0], expansion_target[1]),
+            )
+        )
+        return deploy_cells[0]
 
     def _pick_expansion_target(self, obs: OpenRAObservation) -> Optional[Tuple[int, int]]:
         patch_target = self._best_expansion_patch_target(obs)
