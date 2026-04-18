@@ -449,6 +449,7 @@ class NormalAIBot:
         self._squad_last_progress_tick: dict[str, int] = {}
         self._squad_last_progress_pos: dict[str, Tuple[int, int]] = {}
         self._squad_last_target_point: dict[str, Tuple[int, int]] = {}
+        self._squad_leader_id: dict[str, int] = {}
         self._attack_commands_issued = 0
         self._attack_move_commands_issued = 0
         self._unit_target_events = 0
@@ -1515,6 +1516,59 @@ class NormalAIBot:
             ))
         return commands
 
+    def _select_ground_squad_leader(
+        self,
+        squad_name: str,
+        squad_units: list[UnitInfoModel],
+        force_new: bool = False,
+    ) -> UnitInfoModel:
+        leader_id = self._squad_leader_id.get(squad_name, 0)
+        if not force_new and leader_id > 0:
+            for unit in squad_units:
+                if unit.actor_id == leader_id:
+                    return unit
+
+        leader = self._select_squad_leader(squad_units)
+        self._squad_leader_id[squad_name] = leader.actor_id
+        return leader
+
+    def _unregister_ground_squad(
+        self,
+        squad_name: str,
+        squad_units: list[UnitInfoModel],
+    ) -> None:
+        unit_ids = [u.actor_id for u in squad_units]
+        if squad_name == "assault":
+            self._attack_squad = []
+        elif squad_name == "rush":
+            self._rush_squad = []
+
+        existing = set(self._idle_ground_units)
+        self._idle_ground_units.extend(uid for uid in unit_ids if uid not in existing)
+        self._squad_leader_id.pop(squad_name, None)
+        self._clear_squad_target(squad_name)
+        self._set_squad_state(squad_name, "assemble")
+
+    def _ground_flee_commands(
+        self,
+        obs: OpenRAObservation,
+        squad_name: str,
+        squad_units: list[UnitInfoModel],
+    ) -> List[CommandModel]:
+        fallback = self._random_own_building_cell(obs)
+        commands: list[CommandModel] = []
+        if fallback is not None:
+            tx, ty = fallback
+            for unit in squad_units:
+                commands.append(CommandModel(
+                    action=ActionType.MOVE,
+                    actor_id=unit.actor_id,
+                    target_x=tx,
+                    target_y=ty,
+                ))
+        self._unregister_ground_squad(squad_name, squad_units)
+        return commands
+
     def _handle_field_squad(
         self,
         obs: OpenRAObservation,
@@ -1534,7 +1588,16 @@ class NormalAIBot:
             self._squad_last_commit_tick[squad_name] = -9999
 
         state = self._current_squad_state(obs, squad_name)
-        leader = self._select_squad_leader(squad_units)
+        literal_ground = squad_name in {"assault", "rush"}
+        if literal_ground and state in {"retreat", "recover"}:
+            state = "assemble"
+            self._set_squad_state(squad_name, "assemble")
+
+        leader = (
+            self._select_ground_squad_leader(squad_name, squad_units)
+            if literal_ground
+            else self._select_squad_leader(squad_units)
+        )
         local_enemy_units = self._visible_enemy_units_near(obs, leader.cell_x, leader.cell_y, LOCAL_FIGHT_RADIUS)
         local_enemy_buildings = self._visible_enemy_buildings_near(obs, leader.cell_x, leader.cell_y, LOCAL_FIGHT_RADIUS)
 
@@ -1557,6 +1620,9 @@ class NormalAIBot:
             ):
                 should_flee = False
 
+            if should_flee and literal_ground:
+                return self._ground_flee_commands(obs, squad_name, squad_units)
+
             if should_flee:
                 retreat_commands = self._retreat_squad_commands(obs, squad_units, leader)
                 if retreat_commands:
@@ -1574,18 +1640,21 @@ class NormalAIBot:
             )
             if priority_target is not None:
                 self._set_squad_state(squad_name, "commit")
-                focus_commands = self._focus_fire_commands(squad_units, priority_target)
-                if focus_commands:
-                    self._set_squad_target(
-                        squad_name,
-                        priority_target[0],
-                        priority_target[1],
-                        priority_target[2],
-                        priority_target[4],
-                    )
-                    return focus_commands
+                self._set_squad_target(
+                    squad_name,
+                    priority_target[0],
+                    priority_target[1],
+                    priority_target[2],
+                    priority_target[4],
+                )
+                if not literal_ground:
+                    focus_commands = self._focus_fire_commands(squad_units, priority_target)
+                    if focus_commands:
+                        return focus_commands
 
         if state == "retreat":
+            if literal_ground:
+                return self._ground_flee_commands(obs, squad_name, squad_units)
             retreat_commands = self._retreat_squad_commands(obs, squad_units, leader)
             if retreat_commands:
                 return retreat_commands
@@ -1647,7 +1716,13 @@ class NormalAIBot:
                 force_commit = True
                 force_global = True
 
-        regroup_commands = self._regroup_squad_commands(squad_units, leader)
+        regroup_commands = self._regroup_squad_commands(
+            squad_units,
+            leader,
+            regroup_radius=max(1, len(squad_units) // 3) if literal_ground else REGROUP_RADIUS,
+            min_close_units=len(squad_units) if literal_ground else None,
+            circular=literal_ground,
+        )
         if regroup_commands and not force_global:
             self._set_squad_state(squad_name, "regroup")
             self._squad_regroup_count[squad_name] = self._squad_regroup_count.get(squad_name, 0) + 1
@@ -1691,6 +1766,8 @@ class NormalAIBot:
         else:
             attackers = self._attack_wave_units(obs, squad_units) if squad_name == "assault" else squad_units
         direct_attack = self._target_actor_is_visible(obs, target_actor_id, target_kind)
+        if literal_ground:
+            direct_attack = False
         for unit in attackers:
             if direct_attack and (not unit.can_attack or self._busy_attacking(unit)):
                 continue
@@ -1708,6 +1785,10 @@ class NormalAIBot:
                 target_actor_id=target_actor_id,
                 target_kind=target_kind,
             )
+            if literal_ground:
+                self._last_attack_tick = obs.tick
+                self._squad_regroup_count[squad_name] = 0
+                self._squad_last_commit_tick[squad_name] = obs.tick
         elif commands:
             self._record_attack_issue(
                 direct_attack=True,
@@ -2101,6 +2182,13 @@ class NormalAIBot:
             self._clear_search_target()
             self._reset_stale_attack_target()
             return current_target
+
+        target_point = self._squad_target_point.get(squad_name)
+        target_actor_id = self._squad_target_actor_id.get(squad_name, 0)
+        if target_point is not None and target_actor_id > 0:
+            if not self._should_clear_point_target(obs, target_point, leader_x, leader_y):
+                return target_point[0], target_point[1], 0, "point"
+            self._clear_squad_target(squad_name)
 
         if squad_name == "rush" and self._rush_target_pos is not None:
             if self._should_clear_point_target(obs, self._rush_target_pos, leader_x, leader_y):
@@ -2550,6 +2638,11 @@ class NormalAIBot:
             squad_name: target
             for squad_name, target in self._squad_last_target_point.items()
             if squad_name in self._squad_states
+        }
+        self._squad_leader_id = {
+            squad_name: actor_id
+            for squad_name, actor_id in self._squad_leader_id.items()
+            if squad_name in self._squad_states and actor_id in alive
         }
         self._squad_target_actor_id = {
             squad_name: actor_id
@@ -4486,12 +4579,24 @@ class NormalAIBot:
         self,
         squad_units: list[UnitInfoModel],
         leader: UnitInfoModel,
+        regroup_radius: int = REGROUP_RADIUS,
+        min_close_units: Optional[int] = None,
+        circular: bool = False,
     ) -> List[CommandModel]:
+        def within_radius(unit: UnitInfoModel) -> bool:
+            dx = unit.cell_x - leader.cell_x
+            dy = unit.cell_y - leader.cell_y
+            if circular:
+                return dx * dx + dy * dy <= regroup_radius * regroup_radius
+            return self._cell_distance(unit.cell_x, unit.cell_y, leader.cell_x, leader.cell_y) <= regroup_radius
+
         close_units = [
             u for u in squad_units
-            if self._cell_distance(u.cell_x, u.cell_y, leader.cell_x, leader.cell_y) <= REGROUP_RADIUS
+            if within_radius(u)
         ]
-        if len(close_units) >= max(2, int(len(squad_units) * 0.4)):
+        if min_close_units is None:
+            min_close_units = max(2, int(len(squad_units) * 0.4))
+        if len(close_units) >= min_close_units:
             return []
 
         commands = [CommandModel(action=ActionType.STOP, actor_id=leader.actor_id)]
@@ -4499,7 +4604,7 @@ class NormalAIBot:
         for u in squad_units:
             if u.actor_id == leader.actor_id:
                 continue
-            if self._cell_distance(u.cell_x, u.cell_y, leader.cell_x, leader.cell_y) > REGROUP_RADIUS:
+            if not within_radius(u):
                 commands.append(CommandModel(
                     action=ActionType.ATTACK_MOVE,
                     actor_id=u.actor_id,
