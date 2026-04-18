@@ -1035,6 +1035,7 @@ class NormalAIBot:
         self._last_harvester_scan_tick = obs.tick
         reassignment_commands, redirected_harvesters = self._reassign_low_effect_harvesters(obs)
         commands.extend(reassignment_commands)
+        patch_states = self._resource_patch_states(obs)
         for u in obs.units:
             if u.type != "harv":
                 continue
@@ -1051,35 +1052,47 @@ class NormalAIBot:
             if u.actor_id in redirected_harvesters:
                 continue
 
+            recent_damage = self._harvester_recently_damaged(obs, u.actor_id)
             threat = self._nearest_enemy_to_unit(obs, u, HARVESTER_THREAT_RADIUS)
             if threat is not None:
                 self._last_contact_tick = obs.tick
-                current_target = self._harvester_patch_targets.get(u.actor_id)
-                if current_target is not None:
-                    threatened_state = self._nearest_patch_state(
-                        self._resource_patch_states(obs),
-                        current_target[0],
-                        current_target[1],
-                        HARVESTER_PATCH_ASSIGN_RADIUS,
-                        allow_fallback=True,
-                    )
-                    if threatened_state is not None and int(threatened_state["threat"]) > 0:
-                        self._harvester_patch_targets.pop(u.actor_id, None)
-                if obs.tick >= self._harvester_retreat_until.get(u.actor_id, -9999):
-                    fallback = self._pick_harvester_retreat_point(obs, u)
-                    if fallback is not None:
-                        commands.append(CommandModel(
-                            action=ActionType.MOVE,
-                            actor_id=u.actor_id,
-                            target_x=fallback[0],
-                            target_y=fallback[1],
-                        ))
-                        self._harvester_retreat_until[u.actor_id] = obs.tick + HARVESTER_RETREAT_COOLDOWN
-                        self._harvester_last_progress_tick[u.actor_id] = obs.tick
-                continue
+            current_target = self._harvester_patch_targets.get(u.actor_id)
+            if current_target is not None:
+                threatened_state = self._nearest_patch_state(
+                    patch_states,
+                    current_target[0],
+                    current_target[1],
+                    HARVESTER_PATCH_ASSIGN_RADIUS,
+                    allow_fallback=True,
+                )
+                if threatened_state is not None and int(threatened_state["threat"]) > 0:
+                    self._harvester_patch_targets.pop(u.actor_id, None)
+
+            if threat is not None or recent_damage:
+                fallback = self._pick_harvester_retreat_point(obs, u, patch_states=patch_states)
+                if fallback is not None and (
+                    threat is not None
+                    or self._cell_distance(u.cell_x, u.cell_y, fallback[0], fallback[1]) > 2
+                ):
+                    commands.append(CommandModel(
+                        action=ActionType.MOVE,
+                        actor_id=u.actor_id,
+                        target_x=fallback[0],
+                        target_y=fallback[1],
+                    ))
+                    self._harvester_retreat_until[u.actor_id] = obs.tick + HARVESTER_RETREAT_COOLDOWN
+                    self._harvester_reassign_until[u.actor_id] = obs.tick + HARVESTER_REASSIGN_COOLDOWN
+                    self._harvester_last_progress_tick[u.actor_id] = obs.tick
+                    continue
 
             if self._is_low_effect_harvester(obs, u):
-                fallback_target = self._fallback_harvest_target(obs, u)
+                fallback_target = self._fallback_harvest_target(
+                    obs,
+                    u,
+                    patch_states=patch_states,
+                    prefer_safe=recent_damage,
+                    exclude_target=self._harvester_patch_targets.get(u.actor_id),
+                )
                 if fallback_target is not None:
                     commands.append(CommandModel(
                         action=ActionType.HARVEST,
@@ -1096,7 +1109,23 @@ class NormalAIBot:
 
             if u.is_idle:
                 target = self._harvester_patch_targets.get(u.actor_id)
-                if target is not None and self._local_resource_score(target[0], target[1], 2) > 0:
+                target_state = None
+                if target is not None:
+                    target_state = self._nearest_patch_state(
+                        patch_states,
+                        target[0],
+                        target[1],
+                        HARVESTER_PATCH_ASSIGN_RADIUS,
+                        allow_fallback=True,
+                    )
+                if (
+                    target is not None
+                    and self._local_resource_score(target[0], target[1], 2) > HARVESTER_LOCAL_RESOURCE_MIN
+                    and (
+                        target_state is None
+                        or (int(target_state["threat"]) == 0 and float(target_state["depletion_ratio"]) < 0.95)
+                    )
+                ):
                     commands.append(
                         CommandModel(
                             action=ActionType.HARVEST,
@@ -1108,8 +1137,26 @@ class NormalAIBot:
                     self._harvester_last_progress_tick[u.actor_id] = obs.tick
                 else:
                     self._harvester_patch_targets.pop(u.actor_id, None)
-                    commands.append(CommandModel(action=ActionType.HARVEST, actor_id=u.actor_id))
-                    self._harvester_last_progress_tick[u.actor_id] = obs.tick
+                    target = self._fallback_harvest_target(
+                        obs,
+                        u,
+                        patch_states=patch_states,
+                        prefer_safe=recent_damage or self._base_under_pressure(obs),
+                    )
+                    if target is not None:
+                        commands.append(
+                            CommandModel(
+                                action=ActionType.HARVEST,
+                                actor_id=u.actor_id,
+                                target_x=target[0],
+                                target_y=target[1],
+                            )
+                        )
+                        self._harvester_patch_targets[u.actor_id] = target
+                        self._harvester_last_progress_tick[u.actor_id] = obs.tick
+                    else:
+                        commands.append(CommandModel(action=ActionType.HARVEST, actor_id=u.actor_id))
+                        self._harvester_last_progress_tick[u.actor_id] = obs.tick
 
         self._ensure_harvester_requests(obs)
         return commands
@@ -1442,17 +1489,28 @@ class NormalAIBot:
         if local_enemy_units or local_enemy_buildings:
             self._last_contact_tick = obs.tick
             self._reset_stale_attack_target()
-            if not self._should_take_local_fight(
+            should_flee = not self._should_take_local_fight(
                 squad_units,
                 local_enemy_units,
                 local_enemy_buildings,
                 rush=rush or squad_name in {"air", "naval"},
                 cautious=state == "recover",
                 squad_name=squad_name,
+            )
+            if (
+                should_flee
+                and squad_name in {"assault", "rush"}
+                and state != "assemble"
+                and self._has_own_building_near(obs, leader.cell_x, leader.cell_y, LOCAL_FIGHT_RADIUS)
             ):
-                self._set_squad_state(squad_name, "retreat", obs.tick + SQUAD_RETREAT_HOLD_TICKS)
+                should_flee = False
+
+            if should_flee:
                 retreat_commands = self._retreat_squad_commands(obs, squad_units, leader)
                 if retreat_commands:
+                    self._clear_squad_target(squad_name)
+                    self._set_squad_state(squad_name, "retreat", obs.tick + SQUAD_RETREAT_HOLD_TICKS)
+                    self._squad_regroup_count[squad_name] = 0
                     return retreat_commands
 
             priority_target = self._pick_priority_target(
@@ -1582,7 +1640,7 @@ class NormalAIBot:
             attackers = self._attack_wave_units(obs, squad_units) if squad_name == "assault" else squad_units
         direct_attack = self._target_actor_is_visible(obs, target_actor_id, target_kind)
         for unit in attackers:
-            if direct_attack and not unit.can_attack:
+            if direct_attack and (not unit.can_attack or self._busy_attacking(unit)):
                 continue
             commands.append(CommandModel(
                 action=ActionType.ATTACK if direct_attack else ActionType.ATTACK_MOVE,
@@ -2782,10 +2840,13 @@ class NormalAIBot:
         self,
         obs: OpenRAObservation,
         harvester: UnitInfoModel,
+        patch_states: Optional[list[dict[str, object]]] = None,
     ) -> Optional[Tuple[int, int]]:
         refineries = [b for b in obs.buildings if b.type == "proc"]
+        if patch_states is None:
+            patch_states = self._resource_patch_states(obs)
         threatened_patch = self._nearest_patch_state(
-            self._resource_patch_states(obs),
+            patch_states,
             harvester.cell_x,
             harvester.cell_y,
             HARVESTER_PATCH_ASSIGN_RADIUS,
@@ -2822,6 +2883,9 @@ class NormalAIBot:
             )
         return self._base_center(obs)
 
+    def _harvester_recently_damaged(self, obs: OpenRAObservation, actor_id: int) -> bool:
+        return obs.tick < self._harvester_recent_damage_until.get(actor_id, -9999)
+
     def _update_harvester_progress(self, obs: OpenRAObservation, harvester: UnitInfoModel):
         actor_id = harvester.actor_id
         current_cell = (harvester.cell_x, harvester.cell_y)
@@ -2845,6 +2909,8 @@ class NormalAIBot:
             return False
         if obs.tick < self._harvester_retreat_until.get(harvester.actor_id, -9999):
             return False
+        if self._harvester_recently_damaged(obs, harvester.actor_id):
+            return False
         if obs.tick < self._harvester_no_resource_until.get(harvester.actor_id, -9999):
             return False
 
@@ -2865,28 +2931,54 @@ class NormalAIBot:
         self,
         obs: OpenRAObservation,
         harvester: UnitInfoModel,
+        patch_states: Optional[list[dict[str, object]]] = None,
+        prefer_safe: bool = False,
+        exclude_target: Optional[tuple[int, int]] = None,
     ) -> Optional[tuple[int, int]]:
-        patch_states = self._resource_patch_states(obs)
-        candidates = [
-            state
-            for state in patch_states
-            if int(state["threat"]) == 0
-            and int(state["capacity"]) > 0
-            and float(state["depletion_ratio"]) < 0.9
-        ]
+        if patch_states is None:
+            patch_states = self._resource_patch_states(obs)
+        scan_origin = self._pick_harvester_retreat_point(obs, harvester, patch_states=patch_states)
+        if scan_origin is None:
+            scan_origin = (harvester.cell_x, harvester.cell_y)
+
+        current_target = self._harvester_patch_targets.get(harvester.actor_id)
+        candidates = []
+        for state in patch_states:
+            target = state["target"]  # type: ignore[index]
+            if exclude_target is not None and target == exclude_target:
+                continue
+            if int(state["capacity"]) <= 0:
+                continue
+            if float(state["depletion_ratio"]) >= 0.95:
+                continue
+            if self._local_resource_score(target[0], target[1], 2) <= HARVESTER_LOCAL_RESOURCE_MIN:
+                continue
+            if prefer_safe and int(state["threat"]) > 0:
+                continue
+            candidates.append(state)
         if not candidates:
             return None
 
         best = max(
             candidates,
             key=lambda state: (
-                int(state["score"]),
+                int(state["score"])
+                + (140 if int(state["refinery_count"]) > 0 else 0)
+                + (80 if current_target == state["target"] and int(state["threat"]) == 0 and not prefer_safe else 0)
+                - int(max(0.0, float(state["saturation"]) - 1.0) * 420)
+                - self._cell_distance(
+                    scan_origin[0],
+                    scan_origin[1],
+                    state["target"][0],  # type: ignore[index]
+                    state["target"][1],  # type: ignore[index]
+                ) * 18
                 -self._cell_distance(
                     harvester.cell_x,
                     harvester.cell_y,
                     state["target"][0],  # type: ignore[index]
                     state["target"][1],  # type: ignore[index]
-                ),
+                ) * 6
+                - int(state["threat"]) * (480 if prefer_safe else 260),
             ),
         )
         return best["target"]  # type: ignore[return-value]
@@ -3387,6 +3479,8 @@ class NormalAIBot:
         if obs.tick < self._harvester_retreat_until.get(harvester.actor_id, -9999):
             return False
         if obs.tick < self._harvester_reassign_until.get(harvester.actor_id, -9999):
+            return False
+        if self._harvester_recently_damaged(obs, harvester.actor_id):
             return False
         if obs.tick < self._harvester_no_resource_until.get(harvester.actor_id, -9999):
             return False
@@ -4545,7 +4639,7 @@ class NormalAIBot:
         target_actor_id, tx, ty, _, target_kind = target
         commands = []
         for u in squad_units:
-            if not u.can_attack:
+            if not u.can_attack or self._busy_attacking(u):
                 continue
             commands.append(CommandModel(
                 action=ActionType.ATTACK,
@@ -4615,6 +4709,14 @@ class NormalAIBot:
             "targets": {name: self._squad_target_point[name] for name in self._squad_target_point},
         }
 
+    def _busy_attacking(self, unit: UnitInfoModel) -> bool:
+        if unit.is_idle:
+            return False
+        activity = getattr(unit, "current_activity", "").lower().replace(" ", "")
+        if not activity or "attackmove" in activity:
+            return False
+        return "attack" in activity
+
     def _retreat_squad_commands(
         self,
         obs: OpenRAObservation,
@@ -4679,6 +4781,17 @@ class NormalAIBot:
                 best_pos = (bx, by)
 
         return best_pos or self._base_center(obs)
+
+    def _has_own_building_near(self, obs: OpenRAObservation, x: int, y: int, radius: int) -> bool:
+        return any(
+            self._cell_distance(
+                building.cell_x if building.cell_x > 0 else building.pos_x // 1024,
+                building.cell_y if building.cell_y > 0 else building.pos_y // 1024,
+                x,
+                y,
+            ) <= radius
+            for building in obs.buildings
+        )
 
     def _credits_str(self, obs: OpenRAObservation) -> str:
         return (
