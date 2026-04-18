@@ -569,8 +569,7 @@ class NormalAIBot:
                 self._log("Phase -> produce")
         elif self.phase == "produce":
             combat = [u for u in obs.units if u.type in COMBAT_TYPES]
-            has_weap = any(b.type in WAR_FACTORY_TYPES for b in obs.buildings)
-            if has_weap or len(combat) >= self._assault_threshold or obs.tick >= RUSH_TICKS:
+            if self._build_index >= len(BUILD_ORDER):
                 self.phase = "active"
                 self._log(f"Phase -> active ({len(combat)} combat units)")
 
@@ -948,6 +947,10 @@ class NormalAIBot:
         credits = self._available_credits(obs)
         if credits < PRODUCTION_MIN_CASH_REQUIREMENT:
             return commands
+        if not any(self._is_structure_queue(p.queue_type) for p in obs.production):
+            structure_reservation = self._priority_structure_reservation(obs)
+            if structure_reservation > 0 and credits < structure_reservation:
+                return commands
         self._last_unit_tick = obs.tick
 
         requested = self._queue_requested_unit(obs)
@@ -1348,6 +1351,9 @@ class NormalAIBot:
             unassigned_ground.sort(key=lambda u: u.actor_id)
 
         self._idle_ground_units.extend(u.actor_id for u in unassigned_ground)
+
+        if self.phase != "active":
+            return
 
         # OpenRA keeps rush squads separate from assault squads and periodically
         # moves all idle base units into the rush squad when the rush trigger fires.
@@ -1795,9 +1801,38 @@ class NormalAIBot:
 
         return best[1] if best is not None else None
 
+    def _pick_protection_threat(
+        self,
+        obs: OpenRAObservation,
+        threat_enemies: list[UnitInfoModel],
+    ) -> Optional[UnitInfoModel]:
+        if not threat_enemies:
+            return None
+
+        protected_points = self._protected_points(obs)
+        best: Optional[tuple[tuple[int, int, int, int], UnitInfoModel]] = None
+        for enemy in threat_enemies:
+            priority = TARGET_UNIT_PRIORITY.get(enemy.type, 30 if enemy.can_attack else 10)
+            nearest_protected = min(
+                (
+                    self._cell_distance(enemy.cell_x, enemy.cell_y, px, py)
+                    for px, py, _ in protected_points
+                ),
+                default=0,
+            )
+            key = (
+                nearest_protected,
+                -int(enemy.can_attack),
+                -priority,
+                -int((1.0 - enemy.hp_percent) * 100),
+            )
+            if best is None or key < best[0]:
+                best = (key, enemy)
+        return best[1] if best is not None else None
+
     def _handle_defense(self, obs: OpenRAObservation) -> List[CommandModel]:
         threat_enemies = self._base_threat_enemies(obs)
-        threat = next(iter(threat_enemies), None)
+        threat = self._pick_protection_threat(obs, threat_enemies)
         protection_units = self._squad_units(obs, self._protection_squad)
 
         if threat is not None:
@@ -3059,6 +3094,10 @@ class NormalAIBot:
             return 0
         item = self._resolve_build_item(obs, BUILD_ORDER[self._build_index])
         if item is None or self._already_have(obs, item, self._build_index):
+            return 0
+        if not self._can_produce(obs, item):
+            return 0
+        if not self._structure_queue_available(obs, item):
             return 0
         return self._build_cost(item)
 
