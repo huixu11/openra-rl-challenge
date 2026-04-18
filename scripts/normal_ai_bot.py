@@ -336,6 +336,7 @@ RUSH_SQUAD_MIN_SIZE = 6
 AIR_SQUAD_MIN_SIZE = 2
 NAVAL_SQUAD_MIN_SIZE = 2
 PROTECTION_SQUAD_MIN_SIZE = 4
+RESPOND_TO_ATTACK_COOLDOWN = 30
 SQUAD_RETREAT_HOLD_TICKS = 180
 SQUAD_RECOVER_HOLD_TICKS = 240
 RUSH_COMBAT_TYPES = {"e1", "e3", "apc", "jeep", "1tnk", "2tnk", "3tnk", "arty", "v2rl"}
@@ -408,10 +409,16 @@ class NormalAIBot:
         self._idle_ground_units: list[int] = []
         self._temporary_defenders: set[int] = set()
         self._last_attack_tick = 0
-        self._last_attack_eval_tick = 0
-        self._last_rush_tick = 0
-        self._last_assign_tick = 0
+        self._last_attack_eval_tick = -random.randrange(ATTACK_FORCE_INTERVAL) if ATTACK_FORCE_INTERVAL > 0 else 0
+        rush_jitter = max(1, RUSH_INTERVAL // 20)
+        self._last_rush_tick = random.randint(-rush_jitter, rush_jitter)
+        self._last_assign_tick = -random.randrange(ASSIGN_ROLES_INTERVAL) if ASSIGN_ROLES_INTERVAL > 0 else 0
         self._protection_backoff = PROTECTION_TARGET_BACKOFF_TICKS
+        self._protect_from_actor_id = 0
+        self._protect_from_kind = "point"
+        self._protect_from_point: Optional[Tuple[int, int]] = None
+        self._protect_from_until = -9999
+        self._respond_to_attack_cooldown_until = -9999
         self._assault_threshold = self._roll_assault_threshold()
         self._squad_states: dict[str, str] = {
             "assault": "assemble",
@@ -464,9 +471,9 @@ class NormalAIBot:
         self._unit_requests: list[str] = []
         self._queue_delay_until: dict[str, int] = {}
         self._unit_delay_until: dict[str, int] = {}
-        self._last_mcv_scan_tick = -9999
-        self._last_mcv_build_tick = -9999
-        self._last_conyard_undeploy_tick = -9999
+        self._last_mcv_scan_tick = random.randrange(SCAN_FOR_NEW_MCV_INTERVAL) if SCAN_FOR_NEW_MCV_INTERVAL > 0 else 0
+        self._last_mcv_build_tick = random.randrange(BUILD_MCV_INTERVAL) if BUILD_MCV_INTERVAL > 0 else 0
+        self._last_conyard_undeploy_tick = random.randrange(CONYARD_UNDEPLOY_COOLDOWN) if CONYARD_UNDEPLOY_COOLDOWN > 0 else 0
         self._mcv_targets: dict[int, tuple[int, int]] = {}
         self._mcv_deploy_until: dict[int, int] = {}
         self._harvester_retreat_until: dict[int, int] = {}
@@ -948,16 +955,16 @@ class NormalAIBot:
         credits = self._available_credits(obs)
         if credits < PRODUCTION_MIN_CASH_REQUIREMENT:
             return commands
+        requested = self._queue_requested_unit(obs)
+        if requested:
+            self._last_unit_tick = obs.tick
+            commands.append(requested)
+            return commands
         if not any(self._is_structure_queue(p.queue_type) for p in obs.production):
             structure_reservation = self._priority_structure_reservation(obs)
             if structure_reservation > 0 and credits < structure_reservation:
                 return commands
         self._last_unit_tick = obs.tick
-
-        requested = self._queue_requested_unit(obs)
-        if requested:
-            commands.append(requested)
-            return commands
 
         for _ in range(len(UNIT_QUEUE_ORDER)):
             self._current_queue_index = (self._current_queue_index + 1) % len(UNIT_QUEUE_ORDER)
@@ -1381,6 +1388,9 @@ class NormalAIBot:
                 self._log(f"Launching rush wave ({len(launched)} units) -> {(target_x, target_y)}")
 
         # Launch a fresh assault wave from idle base units once enough have accumulated.
+        if not self._base_under_pressure(obs):
+            self._assault_threshold = self._roll_assault_threshold()
+
         if (
             not self._base_under_pressure(obs)
             and len(self._idle_ground_units) >= self._assault_threshold
@@ -1773,9 +1783,120 @@ class NormalAIBot:
         self._protection_squad = []
         self._temporary_defenders = set()
         self._clear_squad_target("protection")
+        self._clear_protection_response()
         self._set_squad_state("protection", "assemble")
         self._protection_backoff = PROTECTION_TARGET_BACKOFF_TICKS
         return commands
+
+    def _clear_protection_response(self) -> None:
+        self._protect_from_actor_id = 0
+        self._protect_from_kind = "point"
+        self._protect_from_point = None
+        self._protect_from_until = -9999
+
+    def _best_visible_protection_response(
+        self,
+        obs: OpenRAObservation,
+        x: int,
+        y: int,
+    ) -> Optional[Tuple[int, int, int, str]]:
+        best: Optional[tuple[tuple[int, int, int], Tuple[int, int, int, str]]] = None
+
+        for enemy in self._visible_enemy_units_near(obs, x, y, PROTECT_UNIT_SCAN_RADIUS):
+            if not enemy.can_attack:
+                continue
+            dist = self._cell_distance(x, y, enemy.cell_x, enemy.cell_y)
+            priority = TARGET_UNIT_PRIORITY.get(enemy.type, 30)
+            key = (dist, -priority, -int((1.0 - enemy.hp_percent) * 100))
+            candidate = (enemy.cell_x, enemy.cell_y, enemy.actor_id, "unit")
+            if best is None or key < best[0]:
+                best = (key, candidate)
+
+        for building in self._visible_enemy_buildings_near(obs, x, y, PROTECT_UNIT_SCAN_RADIUS):
+            if not self._building_can_attack(building):
+                continue
+            bx, by = self._actor_cell(building)
+            dist = self._cell_distance(x, y, bx, by)
+            priority = TARGET_BUILDING_PRIORITY.get(building.type, 40)
+            key = (dist, -priority, -int((1.0 - building.hp_percent) * 100))
+            candidate = (bx, by, building.actor_id, "building")
+            if best is None or key < best[0]:
+                best = (key, candidate)
+
+        return best[1] if best is not None else None
+
+    def _remember_protection_response(
+        self,
+        obs: OpenRAObservation,
+        x: int,
+        y: int,
+    ) -> None:
+        if obs.tick < self._respond_to_attack_cooldown_until:
+            return
+
+        candidate = self._best_visible_protection_response(obs, x, y)
+        if candidate is None:
+            return
+
+        tx, ty, target_actor_id, target_kind = candidate
+        self._protect_from_actor_id = target_actor_id
+        self._protect_from_kind = target_kind
+        self._protect_from_point = (tx, ty)
+        self._protect_from_until = obs.tick + 1
+        self._respond_to_attack_cooldown_until = obs.tick + RESPOND_TO_ATTACK_COOLDOWN
+
+    def _current_protection_response(
+        self,
+        obs: OpenRAObservation,
+    ) -> Optional[Tuple[int, int, int, str]]:
+        if obs.tick > self._protect_from_until:
+            self._clear_protection_response()
+            return None
+
+        if self._protect_from_actor_id > 0:
+            actor = self._visible_actor_by_target(obs, self._protect_from_actor_id, self._protect_from_kind)
+            if actor is not None:
+                tx, ty = self._actor_cell(actor)
+                self._protect_from_point = (tx, ty)
+                return tx, ty, self._protect_from_actor_id, self._protect_from_kind
+
+        if self._protect_from_point is None:
+            return None
+
+        candidate = self._best_visible_protection_response(obs, self._protect_from_point[0], self._protect_from_point[1])
+        if candidate is not None:
+            tx, ty, target_actor_id, target_kind = candidate
+            self._protect_from_actor_id = target_actor_id
+            self._protect_from_kind = target_kind
+            self._protect_from_point = (tx, ty)
+            return candidate
+
+        self._clear_protection_response()
+        return None
+
+    def _retarget_nearby_squads_to_protection(
+        self,
+        obs: OpenRAObservation,
+        tx: int,
+        ty: int,
+        target_actor_id: int,
+        target_kind: str,
+    ) -> None:
+        for squad_name, squad_ids in (
+            ("assault", self._attack_squad),
+            ("rush", self._rush_squad),
+            ("air", self._air_squad),
+            ("naval", self._naval_squad),
+        ):
+            squad_units = self._squad_units(obs, squad_ids)
+            if not squad_units or not any(u.can_attack for u in squad_units):
+                continue
+
+            leader = self._select_squad_leader(squad_units)
+            if self._cell_distance(leader.cell_x, leader.cell_y, tx, ty) > PROTECT_UNIT_SCAN_RADIUS:
+                continue
+
+            self._set_squad_target(squad_name, target_actor_id, tx, ty, target_kind)
 
     def _find_closest_protection_target(
         self,
@@ -1832,11 +1953,15 @@ class NormalAIBot:
         return best[1] if best is not None else None
 
     def _handle_defense(self, obs: OpenRAObservation) -> List[CommandModel]:
-        threat_enemies = self._base_threat_enemies(obs)
-        threat = self._pick_protection_threat(obs, threat_enemies)
+        response_target = self._current_protection_response(obs)
         protection_units = self._squad_units(obs, self._protection_squad)
+        threat: Optional[UnitInfoModel] = None
+        if response_target is not None and response_target[3] == "unit":
+            threat = next((enemy for enemy in obs.visible_enemies if enemy.actor_id == response_target[2]), None)
 
-        if threat is not None:
+        if threat is not None and response_target is not None:
+            tx, ty, target_actor_id, target_kind = response_target
+            self._retarget_nearby_squads_to_protection(obs, tx, ty, target_actor_id, target_kind)
             alive_units = {u.actor_id: u for u in obs.units}
             idle_defender_count = sum(
                 1
@@ -1851,32 +1976,34 @@ class NormalAIBot:
                 protection_units = self._squad_units(obs, self._protection_squad)
 
         temporary_support: list[UnitInfoModel] = []
-        if threat is not None:
-            desired_total = max(PROTECTION_SQUAD_MIN_SIZE, len(threat_enemies) * 2)
-            extra_needed = max(0, desired_total - len(protection_units))
-            temporary_support = self._emergency_defense_units(obs, extra_needed, threat=threat)
-            self._temporary_defenders = {u.actor_id for u in temporary_support}
+        self._temporary_defenders = set()
+
+        if response_target is None and not protection_units:
+            self._clear_squad_target("protection")
+            self._clear_protection_response()
+            self._set_squad_state("protection", "assemble")
+            self._protection_backoff = PROTECTION_TARGET_BACKOFF_TICKS
+            return []
 
         if not protection_units and not temporary_support:
             self._clear_squad_target("protection")
             self._set_squad_state("protection", "assemble")
-            self._protection_backoff = PROTECTION_TARGET_BACKOFF_TICKS
             return []
 
         leader = self._select_squad_leader(protection_units or temporary_support)
         visible_target = self._get_visible_squad_target_info(obs, "protection")
 
-        if visible_target is not None:
+        if response_target is not None:
+            tx, ty, target_actor_id, target_kind = response_target
+            self._set_squad_target("protection", target_actor_id, tx, ty, target_kind)
+            self._protection_backoff = PROTECTION_TARGET_BACKOFF_TICKS
+        elif visible_target is not None:
             tx, ty, target_actor_id, target_kind = visible_target
             self._protection_backoff = PROTECTION_TARGET_BACKOFF_TICKS
         else:
             replacement = self._find_closest_protection_target(obs, leader)
             if replacement is not None:
                 tx, ty, target_actor_id, target_kind = replacement
-                self._set_squad_target("protection", target_actor_id, tx, ty, target_kind)
-                self._protection_backoff = PROTECTION_TARGET_BACKOFF_TICKS
-            elif threat is not None:
-                tx, ty, target_actor_id, target_kind = threat.cell_x, threat.cell_y, threat.actor_id, "unit"
                 self._set_squad_target("protection", target_actor_id, tx, ty, target_kind)
                 self._protection_backoff = PROTECTION_TARGET_BACKOFF_TICKS
             else:
@@ -1895,20 +2022,22 @@ class NormalAIBot:
 
         commands: list[CommandModel] = []
         issued_ids: set[int] = set()
+        direct_attack = target_actor_id > 0 and target_kind in {"unit", "building"}
         for defender in protection_units + temporary_support:
             if not defender.can_attack or defender.actor_id in issued_ids:
                 continue
             issued_ids.add(defender.actor_id)
             commands.append(CommandModel(
-                action=ActionType.ATTACK_MOVE,
+                action=ActionType.ATTACK if direct_attack else ActionType.ATTACK_MOVE,
                 actor_id=defender.actor_id,
+                target_actor_id=target_actor_id if direct_attack else 0,
                 target_x=tx,
                 target_y=ty,
             ))
 
         if commands:
             self._record_attack_issue(
-                direct_attack=False,
+                direct_attack=direct_attack,
                 command_count=len(commands),
                 target_actor_id=target_actor_id,
                 target_kind=target_kind,
@@ -2527,6 +2656,8 @@ class NormalAIBot:
                 bx, by = self._actor_cell(building)
                 if self._is_home_base_cell(obs, bx, by):
                     self._remember_attack_point(bx, by, obs.tick)
+                    if building.type in PROTECTION_TYPES:
+                        self._remember_protection_response(obs, bx, by)
                 if previous_hp >= REPAIR_REACTIVE_HP_THRESHOLD and building.hp_percent < REPAIR_REACTIVE_HP_THRESHOLD:
                     self._reactive_repair_targets.add(building.actor_id)
         self._previous_building_hp = next_building_hp
@@ -2540,6 +2671,7 @@ class NormalAIBot:
                     unit.type == "harv" and self._is_local_protection_asset(obs, unit.cell_x, unit.cell_y)
                 ):
                     self._remember_attack_point(unit.cell_x, unit.cell_y, obs.tick)
+                    self._remember_protection_response(obs, unit.cell_x, unit.cell_y)
                 if unit.type == "harv":
                     self._harvester_recent_damage_until[unit.actor_id] = obs.tick + HARVESTER_RETREAT_COOLDOWN
         self._previous_unit_hp = next_unit_hp
