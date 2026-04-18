@@ -254,39 +254,17 @@ UNIT_FEEDBACK_TIME = 30
 STALE_TARGET_REACHED_RADIUS = 8
 STALE_TARGET_REDIRECT_LIMIT = 3
 PRODUCTION_MIN_CASH_REQUIREMENT = 500
-QUEUE_PRODUCTION_DELAYS: dict[str, int] = {
-    "Infantry": 12,
-    "Vehicle": 18,
-    "Plane": 30,
-    "Ship": 36,
-    "Aircraft": 22,
-}
-UNIT_PRODUCTION_DELAYS: dict[str, int] = {
-    "dog": 600,
-    "harv": 800,
-    "mcv": 2200,
-    "4tnk": 180,
-    "ttnk": 240,
-    "stnk": 260,
-    "ca": 260,
-    "ss": 220,
-    "msub": 220,
-    "mig": 180,
-    "yak": 160,
-    "heli": 140,
-    "mh60": 140,
-}
+# C# UnitBuilderBotModule@normal relies on FeedbackTime plus queue occupancy;
+# it does not add extra synthetic cooldowns on top of that.
+QUEUE_PRODUCTION_DELAYS: dict[str, int] = {}
+UNIT_PRODUCTION_DELAYS: dict[str, int] = {}
 FOG_CHANNEL = 4  # spatial-map channel: 0=hidden, 0.5=explored, 1=visible
 FRONTIER_REFRESH_TICKS = 650
 LAST_SEEN_ENEMY_TTL_TICKS = 6000
 LAST_SEEN_BASE_TTL_TICKS = 18000
-QUEUE_IDLE_BASE_CAPS: dict[str, int] = {
-    "Infantry": 14,
-    "Vehicle": 9,
-    "Plane": 4,
-    "Ship": 4,
-    "Aircraft": 3,
-}
+# RA NormalAI does not configure IdleBaseUnitsMaximum for UnitBuilderBotModule@normal,
+# so avoid damping production just because squads are currently idling near base.
+QUEUE_IDLE_BASE_CAPS: dict[str, int] = {}
 IDLE_BASE_UNIT_RADIUS = 15
 AIRFIELD_PLANE_CAPACITY = 4
 HELIPAD_AIRCRAFT_CAPACITY = 1
@@ -1471,8 +1449,15 @@ class NormalAIBot:
         reserve_ids = set(self._protection_squad)
         candidates = [
             alive[uid]
-            for uid in self._idle_ground_units + self._rush_squad + self._attack_squad
-            if uid in alive and uid not in reserve_ids and alive[uid].can_attack
+            for uid in self._rush_squad + self._attack_squad
+            if uid in alive
+            and uid not in reserve_ids
+            and alive[uid].can_attack
+            and (
+                threat is None
+                or self._cell_distance(alive[uid].cell_x, alive[uid].cell_y, threat.cell_x, threat.cell_y)
+                <= PROTECT_UNIT_SCAN_RADIUS
+            )
         ]
         if threat is not None:
             base_center = self._base_center(obs) or (threat.cell_x, threat.cell_y)
@@ -1489,6 +1474,13 @@ class NormalAIBot:
                     key=lambda u: self._cell_distance(u.cell_x, u.cell_y, base_center[0], base_center[1])
                 )
         return candidates[:needed]
+
+    def _can_cover_protection_threat(
+        self,
+        unit: UnitInfoModel,
+        threat: UnitInfoModel,
+    ) -> bool:
+        return self._cell_distance(unit.cell_x, unit.cell_y, threat.cell_x, threat.cell_y) <= PROTECT_UNIT_SCAN_RADIUS
 
     def _manage_unit_stances(self, obs: OpenRAObservation) -> List[CommandModel]:
         protection_ids = set(self._protection_squad) | set(self._temporary_defenders)
@@ -1728,6 +1720,7 @@ class NormalAIBot:
             if uid in alive
             and alive[uid].can_attack
             and alive[uid].type not in AIRCRAFT_TYPES | SHIP_TYPES
+            and self._can_cover_protection_threat(alive[uid], threat)
         ]
         candidates.sort(
             key=lambda u: (
@@ -1808,8 +1801,6 @@ class NormalAIBot:
         protection_units = self._squad_units(obs, self._protection_squad)
 
         if threat is not None:
-            # Match C# ProtectOwn more closely: when the base is under attack,
-            # commit all idle base troops that can fight instead of a tiny reserve.
             alive_units = {u.actor_id: u for u in obs.units}
             idle_defender_count = sum(
                 1
@@ -1817,6 +1808,7 @@ class NormalAIBot:
                 if uid in alive_units
                 and alive_units[uid].can_attack
                 and alive_units[uid].type not in AIRCRAFT_TYPES | SHIP_TYPES
+                and self._can_cover_protection_threat(alive_units[uid], threat)
             )
             if idle_defender_count > 0:
                 self._recruit_protection_units(obs, threat, idle_defender_count)
