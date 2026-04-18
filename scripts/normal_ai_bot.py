@@ -304,7 +304,8 @@ MCV_FRIENDLY_REFINERY_DISLIKE_RANGE = 14
 MCV_DEPLOY_OFFSET = (-1, -1)
 EXPANSION_TOLERATE_VALUES = (1, 2)
 FORCE_EXPANSION_TOLERATE_VALUES = (2, 3)
-CONYARD_UNDEPLOY_COOLDOWN = 80
+# Match the C# McvExpansionManager default MoveConyardTick cadence.
+CONYARD_UNDEPLOY_COOLDOWN = 5700
 MCV_DEPLOY_COMMAND_COOLDOWN = 800
 HARVESTER_THREAT_RADIUS = 10
 HARVESTER_RETREAT_COOLDOWN = 120
@@ -754,9 +755,6 @@ class NormalAIBot:
         if obs.tick < self._next_build_check_tick:
             return commands
 
-        structure_in_queue = any(self._is_structure_queue(p.queue_type) for p in obs.production)
-        if structure_in_queue:
-            return commands
         credits = self._available_credits(obs)
         if credits < PRODUCTION_MIN_CASH_REQUIREMENT:
             self._schedule_next_build_check(obs, active=False)
@@ -769,6 +767,9 @@ class NormalAIBot:
                 self._schedule_next_build_check(obs, active=False)
                 return commands
             if not self._structure_queue_available(obs, item):
+                self._schedule_next_build_check(obs, active=False)
+                return commands
+            if self._structure_queue_busy(obs, item):
                 self._schedule_next_build_check(obs, active=False)
                 return commands
             if self._already_have(obs, item, self._build_index):
@@ -793,7 +794,7 @@ class NormalAIBot:
 
         # Phase 2: dynamic base building driven by the normal AI priorities.
         item = self._choose_recovery_building(obs) if self._in_recovery_mode(obs) else self._choose_dynamic_building(obs)
-        if item and self._structure_queue_available(obs, item) and self._can_produce(obs, item):
+        if item and self._structure_queue_available(obs, item) and not self._structure_queue_busy(obs, item) and self._can_produce(obs, item):
             cost = self._build_cost(item)
             if credits >= cost:
                 self._log(f"Building {item} (dynamic, {self._credits_str(obs)})")
@@ -2843,6 +2844,10 @@ class NormalAIBot:
     def _is_structure_queue(self, queue_type: str) -> bool:
         return queue_type in STRUCTURE_QUEUE_TYPES
 
+    def _structure_queue_busy(self, obs: OpenRAObservation, item_type: str) -> bool:
+        queue_type = self._structure_queue_type(item_type)
+        return any(p.queue_type == queue_type for p in obs.production)
+
     def _available_credits(self, obs: OpenRAObservation) -> int:
         # OpenRA splits spendable funds between liquid cash and stored ore/resources.
         return obs.economy.cash + obs.economy.ore
@@ -3756,12 +3761,18 @@ class NormalAIBot:
 
         conyards = [b for b in obs.buildings if b.type == "fact"]
         refineries = [b for b in obs.buildings if b.type == "proc"]
+        active_targets = list(self._mcv_targets.values())
         best: Optional[tuple[int, Tuple[int, int]]] = None
         for state in patch_states:
             target = state["target"]  # type: ignore[index]
             if conyards and self._nearest_distance_to_buildings(target[0], target[1], conyards) < MCV_FRIENDLY_CONYARD_DISLIKE_RANGE:
                 continue
             if refineries and self._nearest_distance_to_buildings(target[0], target[1], refineries) < MCV_FRIENDLY_REFINERY_DISLIKE_RANGE:
+                continue
+            if any(
+                self._cell_distance(target[0], target[1], active_target[0], active_target[1]) < MCV_FRIENDLY_CONYARD_DISLIKE_RANGE
+                for active_target in active_targets
+            ):
                 continue
 
             if int(state["threat"]) > 0:
@@ -4121,59 +4132,8 @@ class NormalAIBot:
             return 0
         if not self._production_support_available(obs, item_type, unit_counts):
             return 0
-        if item_type in AIRCRAFT_TYPES and self._available_credits(obs) < 3000:
-            return 0
         if item_type == "harv":
             return share if unit_counts.get("harv", 0) < self._harvester_target(obs) else 0
-        if item_type == "dog" and (obs.tick > 2500 or any(b.type in WAR_FACTORY_TYPES for b in obs.buildings)):
-            return 0
-
-        has_weap = any(b.type in WAR_FACTORY_TYPES for b in obs.buildings)
-        base_under_pressure = self._base_under_pressure(obs)
-        economy_ready_for_tech = self._economy_ready_for_tech(obs)
-        refinery_count = sum(1 for b in obs.buildings if b.type == "proc")
-        infantry_count = sum(unit_counts.get(t, 0) for t in INFANTRY_TYPES if t != "dog")
-        vehicle_count = sum(unit_counts.get(t, 0) for t in VEHICLE_TYPES if t not in {"harv", "mcv"})
-
-        if queue_type is not None and not base_under_pressure:
-            idle_cap = QUEUE_IDLE_BASE_CAPS.get(queue_type)
-            if idle_cap is not None and self._idle_base_unit_count(obs, queue_type) >= idle_cap:
-                if item_type in {"dog", "e1", "e2", "e3", "jeep", "apc", "ftrk", "pt"}:
-                    return 0
-                if queue_type in {"Plane", "Aircraft", "Ship"}:
-                    return 0
-                share = int(share * 0.55)
-
-        if item_type in AIRCRAFT_TYPES | SHIP_TYPES and not economy_ready_for_tech:
-            return 0
-        if item_type in {"4tnk", "ttnk", "stnk"} and (not economy_ready_for_tech or refinery_count < 2):
-            share = int(share * 0.55)
-        if base_under_pressure and item_type in AIRCRAFT_TYPES | SHIP_TYPES:
-            return 0
-
-        if has_weap:
-            if item_type in INFANTRY_TYPES:
-                share = max(0, int(share * 0.85))
-                if infantry_count >= 36 and vehicle_count < max(10, infantry_count // 3):
-                    return 0
-            elif item_type in {"1tnk", "2tnk", "3tnk", "4tnk", "ttnk", "stnk", "arty", "v2rl"}:
-                share = int(share * 1.2)
-            elif item_type in {"apc", "jeep", "ftrk"}:
-                share = int(share * 1.1)
-
-        if base_under_pressure:
-            if item_type in {"e1", "e3", "apc", "jeep", "ftrk", "1tnk", "2tnk", "arty", "v2rl"}:
-                share = int(share * 1.15)
-            elif item_type in {"4tnk", "ttnk", "stnk"}:
-                share = int(share * 0.75)
-
-        if self._in_recovery_mode(obs):
-            if item_type in AIRCRAFT_TYPES:
-                return 0
-            if item_type in {"e1", "e3", "apc", "jeep", "ftrk", "1tnk", "2tnk", "arty", "v2rl"}:
-                share = int(share * 1.25)
-            elif item_type in {"4tnk", "ttnk", "stnk"}:
-                share = int(share * 0.7)
 
         return share
 
