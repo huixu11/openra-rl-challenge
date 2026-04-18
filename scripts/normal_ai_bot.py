@@ -953,13 +953,10 @@ class NormalAIBot:
         commands = []
         if self.phase == "deploy_mcv":
             return commands
-        if self._last_build_tick == obs.tick or obs.tick - self._last_unit_tick < UNIT_FEEDBACK_TIME:
+        if obs.tick - self._last_unit_tick < UNIT_FEEDBACK_TIME:
             return commands
         credits = self._available_credits(obs)
         if credits < PRODUCTION_MIN_CASH_REQUIREMENT:
-            return commands
-        reserved_for_build = max(self._pending_build_cost(obs), self._priority_structure_reservation(obs))
-        if reserved_for_build and credits < reserved_for_build:
             return commands
         self._last_unit_tick = obs.tick
 
@@ -1371,7 +1368,12 @@ class NormalAIBot:
             self._log(f"Assembling {squad_name} squad ({redirected}/{len(squad_units)})")
         return commands
 
-    def _emergency_defense_units(self, obs: OpenRAObservation, needed: int) -> list[UnitInfoModel]:
+    def _emergency_defense_units(
+        self,
+        obs: OpenRAObservation,
+        needed: int,
+        threat: Optional[UnitInfoModel] = None,
+    ) -> list[UnitInfoModel]:
         if needed <= 0:
             return []
 
@@ -1382,11 +1384,20 @@ class NormalAIBot:
             for uid in self._idle_ground_units + self._rush_squad + self._attack_squad
             if uid in alive and uid not in reserve_ids and alive[uid].can_attack
         ]
-        base_center = self._base_center(obs)
-        if base_center is not None:
+        if threat is not None:
+            base_center = self._base_center(obs) or (threat.cell_x, threat.cell_y)
             candidates.sort(
-                key=lambda u: self._cell_distance(u.cell_x, u.cell_y, base_center[0], base_center[1])
+                key=lambda u: (
+                    self._cell_distance(u.cell_x, u.cell_y, threat.cell_x, threat.cell_y),
+                    self._cell_distance(u.cell_x, u.cell_y, base_center[0], base_center[1]),
+                )
             )
+        else:
+            base_center = self._base_center(obs)
+            if base_center is not None:
+                candidates.sort(
+                    key=lambda u: self._cell_distance(u.cell_x, u.cell_y, base_center[0], base_center[1])
+                )
         return candidates[:needed]
 
     def _manage_unit_stances(self, obs: OpenRAObservation) -> List[CommandModel]:
@@ -1689,20 +1700,39 @@ class NormalAIBot:
         return best[1] if best is not None else None
 
     def _handle_defense(self, obs: OpenRAObservation) -> List[CommandModel]:
-        threat = next(iter(self._base_threat_enemies(obs)), None)
+        threat_enemies = self._base_threat_enemies(obs)
+        threat = next(iter(threat_enemies), None)
         protection_units = self._squad_units(obs, self._protection_squad)
 
-        if threat is not None and len(protection_units) < PROTECTION_SQUAD_MIN_SIZE:
-            self._recruit_protection_units(obs, threat, PROTECTION_SQUAD_MIN_SIZE - len(protection_units))
-            protection_units = self._squad_units(obs, self._protection_squad)
+        if threat is not None:
+            # Match C# ProtectOwn more closely: when the base is under attack,
+            # commit all idle base troops that can fight instead of a tiny reserve.
+            alive_units = {u.actor_id: u for u in obs.units}
+            idle_defender_count = sum(
+                1
+                for uid in self._idle_ground_units
+                if uid in alive_units
+                and alive_units[uid].can_attack
+                and alive_units[uid].type not in AIRCRAFT_TYPES | SHIP_TYPES
+            )
+            if idle_defender_count > 0:
+                self._recruit_protection_units(obs, threat, idle_defender_count)
+                protection_units = self._squad_units(obs, self._protection_squad)
 
-        if not protection_units:
+        temporary_support: list[UnitInfoModel] = []
+        if threat is not None:
+            desired_total = max(PROTECTION_SQUAD_MIN_SIZE, len(threat_enemies) * 2)
+            extra_needed = max(0, desired_total - len(protection_units))
+            temporary_support = self._emergency_defense_units(obs, extra_needed, threat=threat)
+            self._temporary_defenders = {u.actor_id for u in temporary_support}
+
+        if not protection_units and not temporary_support:
             self._clear_squad_target("protection")
             self._set_squad_state("protection", "assemble")
             self._protection_backoff = PROTECTION_TARGET_BACKOFF_TICKS
             return []
 
-        leader = self._select_squad_leader(protection_units)
+        leader = self._select_squad_leader(protection_units or temporary_support)
         visible_target = self._get_visible_squad_target_info(obs, "protection")
 
         if visible_target is not None:
@@ -1712,6 +1742,10 @@ class NormalAIBot:
             replacement = self._find_closest_protection_target(obs, leader)
             if replacement is not None:
                 tx, ty, target_actor_id, target_kind = replacement
+                self._set_squad_target("protection", target_actor_id, tx, ty, target_kind)
+                self._protection_backoff = PROTECTION_TARGET_BACKOFF_TICKS
+            elif threat is not None:
+                tx, ty, target_actor_id, target_kind = threat.cell_x, threat.cell_y, threat.actor_id, "unit"
                 self._set_squad_target("protection", target_actor_id, tx, ty, target_kind)
                 self._protection_backoff = PROTECTION_TARGET_BACKOFF_TICKS
             else:
@@ -1729,9 +1763,11 @@ class NormalAIBot:
         self._set_squad_state("protection", "commit")
 
         commands: list[CommandModel] = []
-        for defender in protection_units:
-            if not defender.can_attack:
+        issued_ids: set[int] = set()
+        for defender in protection_units + temporary_support:
+            if not defender.can_attack or defender.actor_id in issued_ids:
                 continue
+            issued_ids.add(defender.actor_id)
             commands.append(CommandModel(
                 action=ActionType.ATTACK_MOVE,
                 actor_id=defender.actor_id,
@@ -2676,7 +2712,7 @@ class NormalAIBot:
         return sum(1 for u in obs.units if u.type in COMBAT_TYPES)
 
     def _in_recovery_mode(self, obs: OpenRAObservation) -> bool:
-        return False
+        return obs.tick < self._recovery_until_tick
 
     def _base_center(self, obs: OpenRAObservation) -> Optional[Tuple[int, int]]:
         cy = self._find_building(obs, "fact")
