@@ -484,6 +484,8 @@ class NormalAIBot:
         self._harvester_last_cells: dict[int, tuple[int, int]] = {}
         self._harvester_last_progress_tick: dict[int, int] = {}
         self._harvester_no_resource_until: dict[int, int] = {}
+        self._expansion_refinery_goal = 0
+        self._expansion_refinery_until_tick = -9999
         self._combat_peak = 0
         self._last_contact_tick = -9999
         self._recovery_until_tick = -9999
@@ -807,6 +809,8 @@ class NormalAIBot:
             if credits >= cost:
                 self._log(f"Building {item} (dynamic, {self._credits_str(obs)})")
                 commands.append(CommandModel(action=ActionType.BUILD, item_type=item))
+                if item == "proc":
+                    self._clear_expansion_refinery_need()
                 self._last_build_tick = obs.tick
                 self._schedule_next_build_check(obs, active=True)
             else:
@@ -849,6 +853,13 @@ class NormalAIBot:
             if self._can_produce(obs, "proc"):
                 return "proc"
             return power_item
+
+        if (
+            self._expansion_refinery_pending(obs)
+            and self._can_produce(obs, "proc")
+            and self._structure_queue_available(obs, "proc")
+        ):
+            return "proc"
 
         if (
             credits > NEW_PRODUCTION_CASH_THRESHOLD
@@ -1194,6 +1205,7 @@ class NormalAIBot:
             if target is not None and self._cell_distance(mcv.cell_x, mcv.cell_y, *target) <= MCV_TARGET_REACHED_RADIUS:
                 if self._can_mcv_deploy_at(obs, mcv.cell_x, mcv.cell_y):
                     self._log(f"Deploying expansion MCV #{mcv.actor_id} at ({mcv.cell_x}, {mcv.cell_y})")
+                    self._remember_expansion_refinery_need(obs)
                     self._mcv_deploy_until[mcv.actor_id] = obs.tick + MCV_DEPLOY_COMMAND_COOLDOWN
                     commands.append(CommandModel(action=ActionType.DEPLOY, actor_id=mcv.actor_id))
                     self._mcv_targets.pop(mcv.actor_id, None)
@@ -1209,6 +1221,7 @@ class NormalAIBot:
                 if expansion_target is None:
                     if self._can_mcv_deploy_at(obs, mcv.cell_x, mcv.cell_y):
                         self._log(f"Deploying expansion MCV #{mcv.actor_id} at ({mcv.cell_x}, {mcv.cell_y})")
+                        self._remember_expansion_refinery_need(obs)
                         self._mcv_deploy_until[mcv.actor_id] = obs.tick + MCV_DEPLOY_COMMAND_COOLDOWN
                         commands.append(CommandModel(action=ActionType.DEPLOY, actor_id=mcv.actor_id))
                     continue
@@ -1216,6 +1229,7 @@ class NormalAIBot:
                 if target is None:
                     if self._can_mcv_deploy_at(obs, mcv.cell_x, mcv.cell_y):
                         self._log(f"Deploying expansion MCV #{mcv.actor_id} at ({mcv.cell_x}, {mcv.cell_y})")
+                        self._remember_expansion_refinery_need(obs)
                         self._mcv_deploy_until[mcv.actor_id] = obs.tick + MCV_DEPLOY_COMMAND_COOLDOWN
                         commands.append(CommandModel(action=ActionType.DEPLOY, actor_id=mcv.actor_id))
                     continue
@@ -1225,6 +1239,7 @@ class NormalAIBot:
             if self._cell_distance(mcv.cell_x, mcv.cell_y, *target) <= MCV_TARGET_REACHED_RADIUS:
                 if self._can_mcv_deploy_at(obs, mcv.cell_x, mcv.cell_y):
                     self._log(f"Deploying expansion MCV #{mcv.actor_id} at ({mcv.cell_x}, {mcv.cell_y})")
+                    self._remember_expansion_refinery_need(obs)
                     self._mcv_deploy_until[mcv.actor_id] = obs.tick + MCV_DEPLOY_COMMAND_COOLDOWN
                     commands.append(CommandModel(action=ActionType.DEPLOY, actor_id=mcv.actor_id))
                     self._mcv_targets.pop(mcv.actor_id, None)
@@ -1256,43 +1271,33 @@ class NormalAIBot:
         return sum(1 for item in self._unit_requests if item == item_type)
 
     def _queue_requested_unit(self, obs: OpenRAObservation) -> Optional[CommandModel]:
-        idx = 0
-        while idx < len(self._unit_requests):
-            item_type = self._unit_requests[idx]
+        while self._unit_requests:
+            item_type = self._unit_requests.pop(0)
             if item_type == "harv":
                 current = self._current_unit_count(obs, "harv")
                 pending = sum(1 for p in obs.production if p.item == "harv")
                 queued = self._requested_production_count("harv")
-                if current + pending + queued - 1 >= self._harvester_target(obs):
-                    del self._unit_requests[idx]
+                if current + pending + queued >= self._harvester_target(obs):
                     continue
                 if self._should_delay_harvester_request(obs, current):
-                    idx += 1
-                    continue
+                    return None
+
             queue_type = self._queue_type_for_unit(item_type)
             if queue_type is None:
-                del self._unit_requests[idx]
                 continue
             if item_type not in {"harv", "mcv"} and self._queue_delay_active(obs, queue_type):
-                idx += 1
-                continue
+                return None
             if item_type not in {"harv", "mcv"} and self._unit_delay_active(obs, item_type):
-                idx += 1
-                continue
+                return None
             if any(p.queue_type == queue_type for p in obs.production):
-                idx += 1
-                continue
+                return None
             if not self._can_produce(obs, item_type):
-                idx += 1
-                continue
+                return None
             if not self._production_support_available(obs, item_type):
-                idx += 1
-                continue
+                return None
             if self._unit_at_limit(obs, item_type):
-                del self._unit_requests[idx]
                 continue
 
-            del self._unit_requests[idx]
             self._mark_unit_trained(obs, item_type, queue_type)
             self._log(f"Training {item_type} (requested)")
             return CommandModel(action=ActionType.TRAIN, item_type=item_type)
@@ -3493,6 +3498,9 @@ class NormalAIBot:
         if not self._has_adequate_refinery_count(obs) and self._can_produce(obs, "proc") and self._structure_queue_available(obs, "proc"):
             return self._build_cost("proc")
 
+        if self._expansion_refinery_pending(obs) and self._can_produce(obs, "proc") and self._structure_queue_available(obs, "proc"):
+            return self._build_cost("proc")
+
         if self._in_recovery_mode(obs):
             bldg_counts = self._building_counts(obs)
             if (
@@ -4137,16 +4145,7 @@ class NormalAIBot:
         target = INITIAL_MIN_REFINERY_COUNT
         if self._has_any_production_building(obs):
             target += ADDITIONAL_MIN_REFINERY_COUNT
-
-        patch_states = self._resource_patch_states(obs)
-        strong_patches = sum(
-            1
-            for state in patch_states
-            if int(state["threat"]) == 0
-            and float(state["depletion_ratio"]) < 0.75
-            and int(state["refinery_score"]) > 0
-        )
-        return max(target, min(3, strong_patches))
+        return target
 
     def _has_adequate_refinery_count(self, obs: OpenRAObservation) -> bool:
         refinery_count = sum(1 for b in obs.buildings if b.type == "proc")
@@ -4315,32 +4314,10 @@ class NormalAIBot:
             return 0
 
         target = max(INITIAL_HARVESTERS, refinery_count)
-        patch_states = self._resource_patch_states(obs)
-        if patch_states:
-            safe_capacity = sum(
-                min(
-                    int(state["capacity"]),
-                    1 if int(state["refinery_count"]) <= 0 else int(state["capacity"]),
-                )
-                for state in patch_states
-                if int(state["threat"]) == 0
-                and float(state["depletion_ratio"]) < 0.9
-                and int(state["score"]) > -300
-            )
-            if safe_capacity > 0:
-                desired_cap = INITIAL_HARVESTERS + max(0, refinery_count - 1)
-                target = max(refinery_count, min(safe_capacity, desired_cap))
-
-        target = min(target, UNIT_LIMITS.get("harv", target))
-        if self._in_recovery_mode(obs):
-            recovery_cap = 0 if refinery_count == 0 else 2 if refinery_count == 1 else RECOVERY_HARVESTER_CAP
-            target = min(target, recovery_cap)
-        return target
+        return min(target, UNIT_LIMITS.get("harv", target))
 
     def _should_delay_harvester_request(self, obs: OpenRAObservation, current_harvesters: int) -> bool:
-        if not self._in_recovery_mode(obs):
-            return False
-        return current_harvesters >= self._harvester_target(obs) and self._combat_unit_count(obs) < RECOVERY_EXIT_COMBAT
+        return False
 
     def _desired_unit_share(
         self,
@@ -4363,9 +4340,6 @@ class NormalAIBot:
         return share
 
     def _ensure_mcv_requests(self, obs: OpenRAObservation):
-        if self._in_recovery_mode(obs):
-            return
-
         mcvs = sum(1 for u in obs.units if u.type == "mcv")
         conyards = sum(1 for b in obs.buildings if b.type == "fact")
         if (conyards <= 0 and mcvs > 1) or (conyards > 0 and mcvs > 0):
@@ -4384,6 +4358,30 @@ class NormalAIBot:
         if self._available_credits(obs) >= BUILD_ADDITIONAL_MCV_CASH_AMOUNT:
             return MINIMUM_CONSTRUCTION_YARD_COUNT + ADDITIONAL_CONSTRUCTION_YARD_COUNT
         return MINIMUM_CONSTRUCTION_YARD_COUNT
+
+    def _expansion_refinery_pending(self, obs: OpenRAObservation) -> bool:
+        if self._expansion_refinery_goal <= 0:
+            return False
+        if obs.tick >= self._expansion_refinery_until_tick:
+            self._clear_expansion_refinery_need()
+            return False
+
+        current = sum(1 for b in obs.buildings if b.type == "proc")
+        current += sum(1 for p in obs.production if p.item == "proc")
+        if current >= self._expansion_refinery_goal:
+            self._clear_expansion_refinery_need()
+            return False
+        return True
+
+    def _remember_expansion_refinery_need(self, obs: OpenRAObservation):
+        current = sum(1 for b in obs.buildings if b.type == "proc")
+        current += sum(1 for p in obs.production if p.item == "proc")
+        self._expansion_refinery_goal = max(self._expansion_refinery_goal, current) + 1
+        self._expansion_refinery_until_tick = max(self._expansion_refinery_until_tick, obs.tick + 2400)
+
+    def _clear_expansion_refinery_need(self):
+        self._expansion_refinery_goal = 0
+        self._expansion_refinery_until_tick = -9999
 
     def _expansion_pressure(self, obs: OpenRAObservation) -> tuple[bool, bool]:
         if self._pick_expansion_target(obs) is None:
