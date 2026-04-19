@@ -307,6 +307,7 @@ FORCE_EXPANSION_TOLERATE_VALUES = (2, 3)
 # Match the C# McvExpansionManager default MoveConyardTick cadence.
 CONYARD_UNDEPLOY_COOLDOWN = 5700
 MCV_DEPLOY_COMMAND_COOLDOWN = 800
+REQUESTED_REFINERY_TTL = 2400
 HARVESTER_THREAT_RADIUS = 10
 HARVESTER_RETREAT_COOLDOWN = 120
 LOW_EFFECT_HARVESTER_SCAN_INTERVAL = 433
@@ -341,6 +342,8 @@ SQUAD_RETREAT_HOLD_TICKS = 180
 SQUAD_RECOVER_HOLD_TICKS = 240
 RUSH_COMBAT_TYPES = {"e1", "e3", "apc", "jeep", "1tnk", "2tnk", "3tnk", "arty", "v2rl"}
 FORCE_COMMIT_UNIT_THRESHOLD = 30
+ECONOMY_ATTACK_HOLD_FORCE = 60
+TECH_ATTACK_HOLD_FORCE = 70
 FORCE_COMMIT_REGROUPS = 3
 FORCE_COMMIT_COOLDOWN = 400
 FORCE_COMMIT_TIME = 1200  # fallback wave timing (ticks) to mirror NormalAI periodic pushes
@@ -476,6 +479,8 @@ class NormalAIBot:
         self._last_mcv_build_tick = random.randrange(BUILD_MCV_INTERVAL) if BUILD_MCV_INTERVAL > 0 else 0
         self._last_conyard_undeploy_tick = random.randrange(CONYARD_UNDEPLOY_COOLDOWN) if CONYARD_UNDEPLOY_COOLDOWN > 0 else 0
         self._mcv_targets: dict[int, tuple[int, int]] = {}
+        self._mcv_resource_targets: dict[int, tuple[int, int]] = {}
+        self._requested_refineries: dict[int, tuple[tuple[int, int], tuple[int, int], int]] = {}
         self._mcv_deploy_until: dict[int, int] = {}
         self._harvester_retreat_until: dict[int, int] = {}
         self._harvester_recent_damage_until: dict[int, int] = {}
@@ -716,6 +721,8 @@ class NormalAIBot:
                 )
             )
             idx = (self._placement_count + retry_index * 5) % min(len(candidates), 16)
+            if plan is not None and "request_id" in plan:
+                self._consume_requested_refinery(plan["request_id"])  # type: ignore[arg-type]
             return candidates[idx]
 
         if item_type in NAVAL_STRUCTURE_TYPES:
@@ -803,18 +810,32 @@ class NormalAIBot:
             return commands
 
         # Phase 2: dynamic base building driven by the normal AI priorities.
-        item = self._choose_recovery_building(obs) if self._in_recovery_mode(obs) else self._choose_dynamic_building(obs)
-        if item and self._structure_queue_available(obs, item) and not self._structure_queue_busy(obs, item) and self._can_produce(obs, item):
+        remaining_credits = credits
+        picker = self._choose_recovery_building if self._in_recovery_mode(obs) else self._choose_dynamic_building
+        for queue_type in ("Building", "Defense"):
+            item = picker(obs, queue_type=queue_type)
+            if item is None:
+                continue
+            if not self._structure_queue_available(obs, item):
+                continue
+            if self._structure_queue_busy(obs, item):
+                continue
+            if not self._can_produce(obs, item):
+                continue
+
             cost = self._build_cost(item)
-            if credits >= cost:
-                self._log(f"Building {item} (dynamic, {self._credits_str(obs)})")
-                commands.append(CommandModel(action=ActionType.BUILD, item_type=item))
-                if item == "proc":
-                    self._clear_expansion_refinery_need()
-                self._last_build_tick = obs.tick
-                self._schedule_next_build_check(obs, active=True)
-            else:
-                self._schedule_next_build_check(obs, active=False)
+            if remaining_credits < cost:
+                continue
+
+            self._log(f"Building {item} (dynamic, {self._credits_str(obs)})")
+            commands.append(CommandModel(action=ActionType.BUILD, item_type=item))
+            remaining_credits -= cost
+            if item == "proc":
+                self._clear_expansion_refinery_need()
+
+        if commands:
+            self._last_build_tick = obs.tick
+            self._schedule_next_build_check(obs, active=True)
         else:
             self._schedule_next_build_check(obs, active=False)
 
@@ -835,12 +856,41 @@ class NormalAIBot:
                      if self._resolve_build_item(obs, p) == item)
         return count >= target
 
-    def _choose_dynamic_building(self, obs: OpenRAObservation) -> Optional[str]:
+    def _choose_dynamic_building(
+        self,
+        obs: OpenRAObservation,
+        queue_type: str = "Building",
+    ) -> Optional[str]:
         bldg_counts = self._building_counts(obs)
         credits = self._available_credits(obs)
         power_balance = obs.economy.power_provided - obs.economy.power_drained
         minimum_excess_power = self._minimum_excess_power_target(obs)
         power_item = self._best_power_building(obs)
+
+        if queue_type == "Defense":
+            total_buildings = max(1, len(obs.buildings))
+            candidates = list(BUILDING_FRACTIONS.keys())
+            random.shuffle(candidates)
+            for item in candidates:
+                if BUILDING_DELAYS.get(item, 0) > obs.tick:
+                    continue
+                resolved_item = self._resolve_build_item(obs, item)
+                if resolved_item is None or not self._can_produce(obs, resolved_item):
+                    continue
+                canonical_item = self._canonical_building_type(resolved_item)
+                if canonical_item not in DEFENSE_STRUCTURE_TYPES:
+                    continue
+                if not self._structure_queue_available(obs, resolved_item):
+                    continue
+                count = bldg_counts.get(canonical_item, 0)
+                limit = BUILDING_LIMITS.get(canonical_item)
+                if limit is not None and count >= limit:
+                    continue
+                if count * 100 > BUILDING_FRACTIONS[item] * total_buildings:
+                    continue
+                return resolved_item
+
+            return None
 
         if power_balance < minimum_excess_power and power_item:
             return power_item
@@ -896,7 +946,7 @@ class NormalAIBot:
             if resolved_item is None or not self._can_produce(obs, resolved_item):
                 continue
             canonical_item = self._canonical_building_type(resolved_item)
-            if canonical_item in NAVAL_STRUCTURE_TYPES:
+            if canonical_item in NAVAL_STRUCTURE_TYPES or canonical_item in DEFENSE_STRUCTURE_TYPES:
                 continue
             if not self._structure_queue_available(obs, resolved_item):
                 continue
@@ -910,12 +960,37 @@ class NormalAIBot:
 
         return None
 
-    def _choose_recovery_building(self, obs: OpenRAObservation) -> Optional[str]:
+    def _choose_recovery_building(
+        self,
+        obs: OpenRAObservation,
+        queue_type: str = "Building",
+    ) -> Optional[str]:
         bldg_counts = self._building_counts(obs)
         credits = self._available_credits(obs)
         power_balance = obs.economy.power_provided - obs.economy.power_drained
         minimum_excess_power = self._minimum_excess_power_target(obs)
         power_item = self._best_power_building(obs)
+
+        if queue_type == "Defense":
+            if not self._base_under_pressure(obs):
+                return None
+
+            defense_count = sum(bldg_counts.get(item, 0) for item in ("ftur", "gun", "pbox"))
+            defense_cap = 1 if self._combat_unit_count(obs) < RECOVERY_EXIT_COMBAT else 2
+            if defense_count >= defense_cap:
+                return None
+
+            for item in ("ftur", "gun", "pbox"):
+                if not self._can_produce(obs, item):
+                    continue
+                if not self._structure_queue_available(obs, item):
+                    continue
+                limit = BUILDING_LIMITS.get(item)
+                if limit is not None and bldg_counts.get(item, 0) >= limit:
+                    continue
+                return item
+
+            return None
 
         if power_balance < minimum_excess_power and power_item:
             return power_item
@@ -940,19 +1015,7 @@ class NormalAIBot:
                 return barracks
 
         if self._base_under_pressure(obs):
-            defense_count = sum(bldg_counts.get(item, 0) for item in ("ftur", "gun", "pbox"))
-            defense_cap = 1 if self._combat_unit_count(obs) < RECOVERY_EXIT_COMBAT else 2
-            if defense_count >= defense_cap:
-                return power_item if power_balance < 0 and power_item else None
-            for item in ("ftur", "gun", "pbox"):
-                if not self._can_produce(obs, item):
-                    continue
-                if not self._structure_queue_available(obs, item):
-                    continue
-                limit = BUILDING_LIMITS.get(item)
-                if limit is not None and bldg_counts.get(item, 0) >= limit:
-                    continue
-                return item
+            return power_item if power_balance < 0 and power_item else None
 
         return None
 
@@ -1202,15 +1265,24 @@ class NormalAIBot:
             if obs.tick < self._mcv_deploy_until.get(mcv.actor_id, -9999):
                 continue
             target = self._mcv_targets.get(mcv.actor_id)
+            resource_target = self._mcv_resource_targets.get(mcv.actor_id)
             if target is not None and self._cell_distance(mcv.cell_x, mcv.cell_y, *target) <= MCV_TARGET_REACHED_RADIUS:
                 if self._can_mcv_deploy_at(obs, mcv.cell_x, mcv.cell_y):
                     self._log(f"Deploying expansion MCV #{mcv.actor_id} at ({mcv.cell_x}, {mcv.cell_y})")
+                    self._remember_requested_refinery(
+                        obs,
+                        mcv.actor_id,
+                        (mcv.cell_x, mcv.cell_y),
+                        resource_target or target,
+                    )
                     self._remember_expansion_refinery_need(obs)
                     self._mcv_deploy_until[mcv.actor_id] = obs.tick + MCV_DEPLOY_COMMAND_COOLDOWN
                     commands.append(CommandModel(action=ActionType.DEPLOY, actor_id=mcv.actor_id))
                     self._mcv_targets.pop(mcv.actor_id, None)
+                    self._mcv_resource_targets.pop(mcv.actor_id, None)
                     continue
                 self._mcv_targets.pop(mcv.actor_id, None)
+                self._mcv_resource_targets.pop(mcv.actor_id, None)
                 target = None
 
             if not mcv.is_idle:
@@ -1221,28 +1293,50 @@ class NormalAIBot:
                 if expansion_target is None:
                     if self._can_mcv_deploy_at(obs, mcv.cell_x, mcv.cell_y):
                         self._log(f"Deploying expansion MCV #{mcv.actor_id} at ({mcv.cell_x}, {mcv.cell_y})")
+                        self._remember_requested_refinery(
+                            obs,
+                            mcv.actor_id,
+                            (mcv.cell_x, mcv.cell_y),
+                            resource_target or (mcv.cell_x, mcv.cell_y),
+                        )
                         self._remember_expansion_refinery_need(obs)
                         self._mcv_deploy_until[mcv.actor_id] = obs.tick + MCV_DEPLOY_COMMAND_COOLDOWN
                         commands.append(CommandModel(action=ActionType.DEPLOY, actor_id=mcv.actor_id))
+                        self._mcv_resource_targets.pop(mcv.actor_id, None)
                     continue
                 target = self._best_mcv_deploy_target(obs, mcv, expansion_target)
                 if target is None:
                     if self._can_mcv_deploy_at(obs, mcv.cell_x, mcv.cell_y):
                         self._log(f"Deploying expansion MCV #{mcv.actor_id} at ({mcv.cell_x}, {mcv.cell_y})")
+                        self._remember_requested_refinery(
+                            obs,
+                            mcv.actor_id,
+                            (mcv.cell_x, mcv.cell_y),
+                            resource_target or expansion_target,
+                        )
                         self._remember_expansion_refinery_need(obs)
                         self._mcv_deploy_until[mcv.actor_id] = obs.tick + MCV_DEPLOY_COMMAND_COOLDOWN
                         commands.append(CommandModel(action=ActionType.DEPLOY, actor_id=mcv.actor_id))
+                        self._mcv_resource_targets.pop(mcv.actor_id, None)
                     continue
                 self._mcv_targets[mcv.actor_id] = target
+                self._mcv_resource_targets[mcv.actor_id] = expansion_target
                 self._log(f"Dispatching MCV #{mcv.actor_id} -> {target} for expansion {expansion_target}")
 
             if self._cell_distance(mcv.cell_x, mcv.cell_y, *target) <= MCV_TARGET_REACHED_RADIUS:
                 if self._can_mcv_deploy_at(obs, mcv.cell_x, mcv.cell_y):
                     self._log(f"Deploying expansion MCV #{mcv.actor_id} at ({mcv.cell_x}, {mcv.cell_y})")
+                    self._remember_requested_refinery(
+                        obs,
+                        mcv.actor_id,
+                        (mcv.cell_x, mcv.cell_y),
+                        resource_target or target,
+                    )
                     self._remember_expansion_refinery_need(obs)
                     self._mcv_deploy_until[mcv.actor_id] = obs.tick + MCV_DEPLOY_COMMAND_COOLDOWN
                     commands.append(CommandModel(action=ActionType.DEPLOY, actor_id=mcv.actor_id))
                     self._mcv_targets.pop(mcv.actor_id, None)
+                    self._mcv_resource_targets.pop(mcv.actor_id, None)
                 continue
 
             commands.append(CommandModel(
@@ -1261,6 +1355,30 @@ class NormalAIBot:
 
         if current < target:
             self._request_unit_production("harv")
+
+    def _hold_attack_for_economy(self, obs: OpenRAObservation) -> bool:
+        if self._base_under_pressure(obs):
+            return False
+        if self._current_requested_refinery(obs) is not None or self._expansion_refinery_pending(obs):
+            return True
+        if self._tech_anchor_pending(obs) and self._combat_unit_count(obs) < TECH_ATTACK_HOLD_FORCE:
+            return True
+
+        expanding = bool(self._mcv_targets) or any(u.type == "mcv" for u in obs.units)
+        expanding = expanding or any(p.item == "mcv" for p in obs.production)
+        if expanding and self._combat_unit_count(obs) < ECONOMY_ATTACK_HOLD_FORCE:
+            return True
+
+        return False
+
+    def _tech_anchor_pending(self, obs: OpenRAObservation) -> bool:
+        if not self._can_produce(obs, "dome"):
+            return False
+        if any(self._canonical_building_type(b.type) == "dome" for b in obs.buildings):
+            return False
+        if any(p.item == "dome" for p in obs.production):
+            return False
+        return True
 
     def _request_unit_production(self, item_type: str):
         if self._requested_production_count(item_type) == 0:
@@ -1373,7 +1491,10 @@ class NormalAIBot:
         # moves all idle base units into the rush squad when the rush trigger fires.
         total_ground_troops = len(self._idle_ground_units) + len(self._attack_squad) + len(self._rush_squad) + len(self._protection_squad)
         rush_units = [ground_by_id[uid] for uid in self._idle_ground_units if uid in ground_by_id]
+        hold_for_economy = self._hold_attack_for_economy(obs)
         if (
+            not hold_for_economy
+            and
             not self._base_under_pressure(obs)
             and obs.tick - self._last_rush_tick >= RUSH_INTERVAL
             and total_ground_troops >= SQUAD_SIZE
@@ -1398,6 +1519,8 @@ class NormalAIBot:
             self._assault_threshold = self._roll_assault_threshold()
 
         if (
+            not hold_for_economy
+            and
             not self._base_under_pressure(obs)
             and len(self._idle_ground_units) >= self._assault_threshold
         ):
@@ -2674,7 +2797,17 @@ class NormalAIBot:
             for actor_id, target in self._mcv_targets.items()
             if actor_id in alive
         }
+        self._mcv_resource_targets = {
+            actor_id: target
+            for actor_id, target in self._mcv_resource_targets.items()
+            if actor_id in alive
+        }
         alive_b = {b.actor_id for b in obs.buildings}
+        self._requested_refineries = {
+            actor_id: request
+            for actor_id, request in self._requested_refineries.items()
+            if request[2] > obs.tick
+        }
         self._mcv_deploy_until = {
             actor_id: tick
             for actor_id, tick in self._mcv_deploy_until.items()
@@ -3951,6 +4084,15 @@ class NormalAIBot:
         if not conyards:
             return None
 
+        requested = self._current_requested_refinery(obs)
+        if requested is not None:
+            request_id, anchor, target = requested
+            return {
+                "anchor": anchor,
+                "target": target,
+                "request_id": request_id,
+            }  # type: ignore[return-value]
+
         best: Optional[tuple[int, Tuple[int, int], Tuple[int, int]]] = None
         for conyard in conyards:
             anchor = (
@@ -4340,6 +4482,9 @@ class NormalAIBot:
         return share
 
     def _ensure_mcv_requests(self, obs: OpenRAObservation):
+        if not any(b.type in WAR_FACTORY_TYPES for b in obs.buildings):
+            return
+
         mcvs = sum(1 for u in obs.units if u.type == "mcv")
         conyards = sum(1 for b in obs.buildings if b.type == "fact")
         if (conyards <= 0 and mcvs > 1) or (conyards > 0 and mcvs > 0):
@@ -4382,6 +4527,37 @@ class NormalAIBot:
     def _clear_expansion_refinery_need(self):
         self._expansion_refinery_goal = 0
         self._expansion_refinery_until_tick = -9999
+
+    def _remember_requested_refinery(
+        self,
+        obs: OpenRAObservation,
+        actor_id: int,
+        conyard_loc: Tuple[int, int],
+        resource_loc: Tuple[int, int],
+    ):
+        self._requested_refineries[actor_id] = (conyard_loc, resource_loc, obs.tick + REQUESTED_REFINERY_TTL)
+
+    def _current_requested_refinery(
+        self,
+        obs: OpenRAObservation,
+    ) -> Optional[tuple[int, Tuple[int, int], Tuple[int, int]]]:
+        refineries = [b for b in obs.buildings if b.type == "proc"]
+        for actor_id, (conyard_loc, resource_loc, expiry_tick) in list(self._requested_refineries.items()):
+            if expiry_tick <= obs.tick:
+                self._requested_refineries.pop(actor_id, None)
+                continue
+            if (
+                refineries
+                and self._nearest_distance_to_buildings(resource_loc[0], resource_loc[1], refineries)
+                < RESOURCE_PATCH_REFINERY_DISLIKE_RADIUS
+            ):
+                self._requested_refineries.pop(actor_id, None)
+                continue
+            return actor_id, conyard_loc, resource_loc
+        return None
+
+    def _consume_requested_refinery(self, actor_id: int):
+        self._requested_refineries.pop(actor_id, None)
 
     def _expansion_pressure(self, obs: OpenRAObservation) -> tuple[bool, bool]:
         if self._pick_expansion_target(obs) is None:
