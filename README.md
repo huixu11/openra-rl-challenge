@@ -20,6 +20,14 @@ See [Bugs Found & Fixed](#bugs-found--fixed) for the full list of 9 bugs fixed.
 
 ## Reproduce
 
+### huggingface env
+```bash
+python scripts/collect_bot_data.py --url https://openra-rl-openra-rl-challenge.hf.space --episodes 1  --max-minutes 10 --bot normal --verbose
+```
+Replay will be saved to local file data/episodes/*.orarep
+
+
+### local (Optional)
 ```bash
 git clone <this-repo>
 cd openra-rl-challenge
@@ -47,7 +55,7 @@ python scripts/collect_bot_data.py --episodes 10 --max-minutes 15 --bot normal -
 
 This uses `NormalAIBot` - a Python reimplementation of OpenRA's `ModularBot@NormalAI` with weighted unit production, dynamic base building, squad management, and economy logic ported from `ai.yaml`.
 
-## Replay file
+#### Replay file (Optional)
 
 To find it in a running container:
 
@@ -61,6 +69,7 @@ To copy one out:
 docker cp openra-rl-server:/root/.config/openra/Replays/ra/{DEV_VERSION}/<file>.orarep .
 ```
 
+## Watch replay
 To build a local OpenRA checkout and open a replay:
 
 ```powershell
