@@ -42,6 +42,8 @@ import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
+from urllib import parse as urlparse
+from urllib import request as urlrequest
 
 # openra_env is installed via: pip install openra-rl
 # scripted_bot.py is vendored in this scripts/ directory
@@ -605,25 +607,102 @@ def available_credits(obs: OpenRAObservation) -> int:
     return obs.economy.cash + obs.economy.ore
 
 
-def copy_replay_artifact(replay_info: dict, output_dir: Path, episode_id: int) -> dict:
-    """Copy the replay locally when the server returned a readable file path."""
-    if not replay_info:
-        return {}
+def build_artifact_url(env_url: str, route: str, query: dict[str, Any] | None = None) -> str:
+    """Build an HTTP URL for the repo's artifact helper endpoints."""
+    base = env_url.rstrip("/")
+    route = route if route.startswith("/") else f"/{route}"
+    if not query:
+        return f"{base}{route}"
+    encoded = urlparse.urlencode({k: v for k, v in query.items() if v is not None})
+    return f"{base}{route}?{encoded}" if encoded else f"{base}{route}"
 
-    replay_path = replay_info.get("path", "")
-    if not replay_path:
-        return replay_info
 
+def download_remote_replay(
+    env_url: str,
+    replay_path: str,
+    output_dir: Path,
+    episode_id: int,
+) -> dict[str, Any]:
+    """Download a replay from a remote OpenRA server artifact endpoint."""
     source = Path(replay_path)
-    if not source.is_file():
-        return replay_info
+    suffix = source.suffix or ".orarep"
+    destination = output_dir / f"episode_{episode_id:03d}{suffix}"
+    download_url = build_artifact_url(
+        env_url,
+        "/artifacts/replay",
+        {"path": replay_path, "delete_after_download": "false"},
+    )
 
-    destination = output_dir / f"episode_{episode_id:03d}{source.suffix}"
-    if source.resolve() != destination.resolve():
-        shutil.copy2(source, destination)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with urlrequest.urlopen(download_url, timeout=120) as response, open(destination, "wb") as out_file:
+        shutil.copyfileobj(response, out_file)
+
+    return {
+        "local_copy": str(destination),
+        "download_url": download_url,
+    }
+
+
+def cleanup_remote_artifacts(
+    env_url: str,
+    replay_paths: list[str] | None = None,
+    delete_logs: bool = True,
+) -> dict[str, Any]:
+    """Delete remote replays/log files from the OpenRA server after download."""
+    payload = {
+        "replay_paths": replay_paths or [],
+        "delete_logs": delete_logs,
+    }
+    request = urlrequest.Request(
+        build_artifact_url(env_url, "/artifacts/cleanup"),
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlrequest.urlopen(request, timeout=30) as response:
+        body = response.read().decode("utf-8")
+    return json.loads(body) if body else {}
+
+
+def copy_replay_artifact(replay_info: dict, output_dir: Path, episode_id: int, env_url: str) -> dict:
+    """Copy or download the replay, then clean remote artifacts when applicable."""
+    if not replay_info:
+        try:
+            cleanup_result = cleanup_remote_artifacts(env_url=env_url, replay_paths=[], delete_logs=True)
+            return {"remote_cleanup": cleanup_result} if cleanup_result else {}
+        except Exception as exc:
+            return {"cleanup_error": f"{type(exc).__name__}: {exc}"}
 
     enriched = dict(replay_info)
-    enriched["local_copy"] = str(destination)
+    replay_path = str(replay_info.get("path", "") or "")
+    source = Path(replay_path) if replay_path else None
+    replay_downloaded = False
+
+    if replay_path and source is not None and source.is_file():
+        destination = output_dir / f"episode_{episode_id:03d}{source.suffix}"
+        if source.resolve() != destination.resolve():
+            shutil.copy2(source, destination)
+        enriched["local_copy"] = str(destination)
+        return enriched
+
+    if replay_path:
+        try:
+            enriched.update(download_remote_replay(env_url, replay_path, output_dir, episode_id))
+            replay_downloaded = True
+        except Exception as exc:
+            enriched["download_error"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        cleanup_result = cleanup_remote_artifacts(
+            env_url=env_url,
+            replay_paths=[replay_path] if replay_downloaded and replay_path else [],
+            delete_logs=True,
+        )
+        if cleanup_result:
+            enriched["remote_cleanup"] = cleanup_result
+    except Exception as exc:
+        enriched["cleanup_error"] = f"{type(exc).__name__}: {exc}"
+
     return enriched
 
 
@@ -965,7 +1044,12 @@ async def collect_all(
                 continue
 
             elapsed = time.time() - t0
-            replay_info = copy_replay_artifact(episode_data.get("replay", {}), output_dir, i)
+            replay_info = copy_replay_artifact(
+                episode_data.get("replay", {}),
+                output_dir,
+                i,
+                env_url=env_url,
+            )
             episode_error = episode_data.get("error", "")
             macro_rows = episode_data.get("macro_rows", [])
             final = episode_data.get("final_observation", {})
@@ -1001,15 +1085,28 @@ async def collect_all(
                 "dataset_path": str(dataset_path),
                 "replay_path": replay_info.get("path", ""),
                 "replay_local_copy": replay_info.get("local_copy", ""),
+                "replay_download_error": replay_info.get("download_error", ""),
+                "replay_cleanup_error": replay_info.get("cleanup_error", ""),
                 "error": episode_error,
             }
             summaries.append(summary)
 
             print(f"  Episode {i} finished ({episode_data.get('step_count', 0)} steps, {elapsed:.0f}s)")
             if replay_info.get("local_copy"):
-                print(f"  Replay copied to {Path(replay_info['local_copy']).name}")
+                print(f"  Replay saved to {Path(replay_info['local_copy']).name}")
             elif replay_info.get("path"):
                 print(f"  Replay available at {replay_info['path']}")
+            if replay_info.get("download_error"):
+                print(f"  Replay download failed: {replay_info['download_error']}")
+            cleanup_info = replay_info.get("remote_cleanup", {})
+            if cleanup_info:
+                print(
+                    "  Remote cleanup:"
+                    f" {len(cleanup_info.get('deleted_replays', []))} replay(s),"
+                    f" {len(cleanup_info.get('deleted_logs', []))} log file(s)"
+                )
+            if replay_info.get("cleanup_error"):
+                print(f"  Remote cleanup failed: {replay_info['cleanup_error']}")
             if episode_error:
                 print(f"  Episode {i} completed with error: {episode_error}")
 

@@ -85,6 +85,7 @@ RUN LIBDIR=$( [ "$(dpkg --print-architecture)" = "arm64" ] && echo "/usr/lib/aar
 COPY --from=python-build /src/openra-rl/openra_env/ /app/openra_env/
 COPY --from=python-build /src/openra-rl/proto/ /app/proto/
 COPY --from=python-build /src/openra-rl/pyproject.toml /app/
+COPY hf_space_server.py /app/hf_space_server.py
 
 COPY --from=python-build /src/openra-rl/docker/entrypoint.sh /entrypoint.sh
 COPY --from=python-build /src/openra-rl/docker/replay-viewer.sh /replay-viewer.sh
@@ -121,4 +122,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["python", "-m", "openra_env.server.app"]
+CMD ["python", "-m", "hf_space_server"]
