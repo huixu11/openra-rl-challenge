@@ -2,7 +2,7 @@
 
 https://youtu.be/YaO-KyHiXfo
 
-Training scripts for **OpenRA-RL** - an environment that lets AI agents play *Command & Conquer: Red Alert*.
+Training scripts for [**OpenRA-RL**](https://github.com/yxc20089/OpenRA-RL) - an environment that lets AI agents play *Command & Conquer: Red Alert*.
 
 ## Prerequisites
 
