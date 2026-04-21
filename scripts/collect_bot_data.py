@@ -50,9 +50,36 @@ from urllib import request as urlrequest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from openra_env.client import OpenRAEnv
+from openra_env.mcp_ws_client import OpenRAMCPClient
 from openra_env.models import OpenRAAction, OpenRAObservation, CommandModel, ActionType
 from scripted_bot import ScriptedBot
 from normal_ai_bot import NormalAIBot
+
+
+class ToolEnabledOpenRAEnv(OpenRAEnv):
+    """OpenRA env client that can issue MCP tool calls on the same WS session."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._rpc_id = 0
+
+    async def call_tool(self, name: str, **kwargs: Any) -> Any:
+        """Call an MCP tool over the existing environment websocket session."""
+        self._rpc_id += 1
+        rpc_request = {
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": name, "arguments": kwargs},
+            "id": self._rpc_id,
+        }
+        response = await self._send_and_receive({"type": "mcp", "data": rpc_request})
+        rpc_response = response.get("data", {})
+
+        if "error" in rpc_response:
+            error = rpc_response["error"]
+            raise RuntimeError(f"Tool '{name}' failed: {error.get('message', error)}")
+
+        return OpenRAMCPClient._unwrap_mcp_result(rpc_response.get("result"))
 
 
 def get_nested(d: dict[str, Any], key: str, default: Any = None) -> Any:
@@ -734,7 +761,7 @@ def infer_outcome(
 
 
 async def wait_for_replay_artifact(
-    env: OpenRAEnv,
+    env: ToolEnabledOpenRAEnv,
     episode_id: int,
     verbose: bool,
     timeout_s: float,
@@ -806,7 +833,7 @@ async def collect_episode(
     result = None
     obs = None
     prev_sig = None
-    async with OpenRAEnv(base_url=env_url, message_timeout_s=300.0) as env:
+    async with ToolEnabledOpenRAEnv(base_url=env_url, message_timeout_s=300.0) as env:
         if verbose:
             print(f"  Episode {episode_id}: Resetting environment (map={map_name})...")
 
