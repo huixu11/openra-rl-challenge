@@ -4,18 +4,9 @@ https://youtu.be/YaO-KyHiXfo
 
 Training scripts for **OpenRA-RL** - an environment that lets AI agents play *Command & Conquer: Red Alert*.
 
-## Why not use the published Docker image?
-
-The published image (`ghcr.io/yxc20089/openra-rl:latest`) has a critical bug: the AI opponent never spawns, so every game is played against nobody and you get zero combat data. This repo builds the server from source instead:
-
-- **`Dockerfile`** - Builds the game server from source. It pins OpenRA to commit `8a5d224223e0498e006a7350a9767a87bd45a708` and clones the OpenRA-RL Python server from GitHub `main`. Rebuild with `--no-cache` when you need the latest merged OpenRA-RL changes.
-- **`scripts/scripted_bot.py`** - Vendored copy of the base `ScriptedBot` class from `OpenRA-RL/examples/`. This removes the need to have the `OpenRA-RL` repo cloned as a sibling directory. `collect_bot_data.py` imports it directly.
-
-See [Bugs Found & Fixed](#bugs-found--fixed) for the full list of 9 bugs fixed.
-
 ## Prerequisites
 
-- Docker
+- Docker (Optional if you want to run OpenRA-RL Env in local)
 - Python 3.11+
 
 ## Reproduce
@@ -25,7 +16,6 @@ See [Bugs Found & Fixed](#bugs-found--fixed) for the full list of 9 bugs fixed.
 python scripts/collect_bot_data.py --url https://openra-rl-openra-rl-challenge.hf.space --episodes 1  --max-minutes 10 --bot normal --verbose
 ```
 Replay will be saved to local file data/episodes/*.orarep
-
 
 ### local (Optional)
 ```bash
@@ -133,32 +123,6 @@ openra-rl-challenge/
 |-- requirements.txt
 `-- README.md
 ```
-
-## Bugs Found & Fixed
-
-The published Docker image (`ghcr.io/yxc20089/openra-rl:latest`) has bugs that prevent data collection. The `Dockerfile` in this repo rebuilds against fixed OpenRA/OpenRA-RL sources, and `collect_bot_data.py` carries the collector-side fixes. Using `docker build` from this repo is required.
-
-### Docker image bugs (fixed by the Dockerfile)
-
-| # | Bug | Root Cause | Fix |
-|---|-----|-----------|-----|
-| 1 | **AI opponent never spawns** (critical) | `OpenRA.Game.dll` is built from an old commit missing `spectate` and `slot_bot` lobby commands in `LoadMap`. The AI player slot is silently dropped. | Dockerfile pins OpenRA to commit `8a5d224223e0498e006a7350a9767a87bd45a708`, which includes the required bot-spawn fixes. |
-| 2 | **Invalid bot type** | `BOT_TYPE=hard` is passed directly to OpenRA, which only accepts `rush`/`normal`/`turtle`/`naval`. Unrecognized types are silently ignored. | Rebuilt image includes `BOT_TYPE_MAP` that translates `hard` -> `normal`. |
-
-### Script bugs (fixed in `collect_bot_data.py`)
-
-| # | Bug | Fix |
-|---|-----|-----|
-| 3 | **Reward off-by-one** - each entry's reward came from the previous action | Reordered loop: capture obs/action, call `step()`, then record reward |
-| 4 | **Soviet barracks (`barr`) missing from rally points** - infantry don't rally | Override `_handle_rally_points` to include `barr` |
-| 5 | **Terminal entry duplicated last reward** | Set terminal entry reward to `0.0` |
-| 6 | **Summary shows empty string instead of "timeout"** | Changed `get("result", "timeout")` to `get("result") or "timeout"` |
-| 7 | **Missing `done` flag in trajectory entries** | Added `"done": result.done` to every entry |
-| 8 | **Map dimensions wrong (128x128 vs 112x54)** - targets outside playable area | `_get_map_size` now updates cache when smaller dimensions are observed |
-| 9 | **Bot leaves enemy base after first contact** | Added `_enemy_base_pos` to remember and re-attack the discovered location |
-
-The collector writes compact macro-policy rows directly into the training dataset and does not save raw trajectory JSON.
-
 ## License
 
 GPL-3.0
