@@ -1,0 +1,39 @@
+name: Push Hugging Face Space
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".gitattributes"
+      - ".hf-space-sync.json"
+      - ".github/workflows/push-hf-space.yml"
+      - "Dockerfile"
+      - "README.md"
+      - "requirements.txt"
+      - "hf_space_server.py"
+      - "scripts/**/*.py"
+
+jobs:
+  sync-space:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Push Space files
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_USERNAME: ${{ vars.HF_USERNAME }}
+        run: |
+          python scripts/push_hf_space.py --commit-message "Sync Space files from ${GITHUB_SHA}"

@@ -1,0 +1,20 @@
+{
+  "space_repo": "openra-rl/openra-rl-challenge",
+  "include": [
+    ".gitattributes",
+    "Dockerfile",
+    "README.md",
+    "requirements.txt",
+    "hf_space_server.py",
+    "scripts/*.py"
+  ],
+  "generated": {
+    "README.md": {
+      "prepend_front_matter": {
+        "title": "OpenRA-RL Challenge",
+        "sdk": "docker",
+        "app_port": 8000
+      }
+    }
+  }
+}
