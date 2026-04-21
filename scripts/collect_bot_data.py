@@ -733,6 +733,43 @@ def infer_outcome(
     return "step_limit"
 
 
+async def wait_for_replay_artifact(
+    env: OpenRAEnv,
+    episode_id: int,
+    verbose: bool,
+    timeout_s: float,
+    poll_interval_s: float = 1.0,
+) -> dict[str, Any]:
+    """Poll for the replay path until OpenRA has flushed it or we time out."""
+    deadline = time.time() + max(timeout_s, 0.0)
+    attempt = 0
+    last_info: dict[str, Any] = {}
+    announced_wait = False
+
+    while True:
+        attempt += 1
+        try:
+            replay_info = await asyncio.wait_for(env.call_tool("get_replay_path"), timeout=10.0)
+        except Exception as exc:
+            replay_info = {"error": f"{type(exc).__name__}: {exc}"}
+
+        last_info = replay_info or {}
+        if str(last_info.get("path", "") or ""):
+            if verbose and attempt > 1:
+                print(f"  Episode {episode_id}: Replay became available after {attempt} check(s).")
+            return last_info
+
+        now = time.time()
+        if now >= deadline:
+            return last_info
+
+        if verbose and not announced_wait:
+            print(f"  Episode {episode_id}: Waiting for replay file to be written...")
+            announced_wait = True
+
+        await asyncio.sleep(poll_interval_s)
+
+
 async def collect_episode(
     env_url: str,
     episode_id: int,
@@ -916,10 +953,13 @@ async def collect_episode(
                 except Exception:
                     pass
 
-        try:
-            replay_info = await asyncio.wait_for(env.call_tool("get_replay_path"), timeout=10.0)
-        except Exception as replay_exc:
-            replay_info = {"error": str(replay_exc)}
+        replay_timeout_s = 25.0 if result is not None and not result.done else 10.0
+        replay_info = await wait_for_replay_artifact(
+            env=env,
+            episode_id=episode_id,
+            verbose=verbose,
+            timeout_s=replay_timeout_s,
+        )
 
         # Record the final observation as a terminal no-op example.
         final_obs = result.observation if result is not None else obs
@@ -1085,6 +1125,7 @@ async def collect_all(
                 "dataset_path": str(dataset_path),
                 "replay_path": replay_info.get("path", ""),
                 "replay_local_copy": replay_info.get("local_copy", ""),
+                "replay_lookup_error": replay_info.get("error", ""),
                 "replay_download_error": replay_info.get("download_error", ""),
                 "replay_cleanup_error": replay_info.get("cleanup_error", ""),
                 "error": episode_error,
@@ -1096,6 +1137,8 @@ async def collect_all(
                 print(f"  Replay saved to {Path(replay_info['local_copy']).name}")
             elif replay_info.get("path"):
                 print(f"  Replay available at {replay_info['path']}")
+            elif replay_info.get("error"):
+                print(f"  Replay unavailable: {replay_info['error']}")
             if replay_info.get("download_error"):
                 print(f"  Replay download failed: {replay_info['download_error']}")
             cleanup_info = replay_info.get("remote_cleanup", {})
