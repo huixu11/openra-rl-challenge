@@ -23,7 +23,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
+
 # #!/usr/bin/env python3
 # """FastAPI wrapper that adds replay/log artifact endpoints for Spaces."""
 
