@@ -69,10 +69,10 @@ async def mount_openra():
 
     try:
         mod = _load_openra_module()
-        openra_app = getattr(mod, "app", None)
-        if openra_app is None:
-            raise RuntimeError("openra_env.server.app has no attribute 'app'")
+        if not hasattr(mod, "get_app"):
+            raise RuntimeError("openra_env.server.app has no attribute 'get_app'")
 
+        openra_app = mod.get_app()
         app.mount("/openra", openra_app)
         _openra_mounted = True
         return {"ok": True, "mounted": True, "path": "/openra"}
