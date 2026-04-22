@@ -12,6 +12,8 @@ Training scripts for [**OpenRA-RL**](https://github.com/yxc20089/OpenRA-RL) - an
 ## Reproduce
 
 ### huggingface env
+https://huggingface.co/spaces/openra-rl/openra-rl-challenge
+
 ```bash
 python scripts/collect_bot_data.py --url https://openra-rl-openra-rl-challenge.hf.space --episodes 1  --max-minutes 10 --bot normal --verbose
 ```
