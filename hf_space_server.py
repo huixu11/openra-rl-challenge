@@ -47,12 +47,6 @@ def _ensure_openra_mounted():
     app.mount(OPENRA_MOUNT_PATH, openra_app)
     _openra_mounted = True
 
-
-@app.on_event("startup")
-async def _startup_mount_openra():
-    _ensure_openra_mounted()
-
-
 @app.get("/")
 async def root():
     return {
