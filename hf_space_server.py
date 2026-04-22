@@ -15,6 +15,13 @@ from pydantic import BaseModel, Field
 app = FastAPI()
 
 OPENRA_MOD = os.environ.get("OPENRA_MOD", "ra")
+OPENRA_MOUNT_PATH = (os.environ.get("OPENRA_MOUNT_PATH", "/openra").strip() or "/openra").rstrip("/")
+if not OPENRA_MOUNT_PATH.startswith("/"):
+    OPENRA_MOUNT_PATH = f"/{OPENRA_MOUNT_PATH}"
+os.environ.setdefault(
+    "OPENRA_INTERNAL_BASE_URL",
+    f"http://localhost:8000{OPENRA_MOUNT_PATH}",
+)
 _openra_module = None
 _openra_mounted = False
 
@@ -24,6 +31,26 @@ def _load_openra_module():
     if _openra_module is None:
         _openra_module = importlib.import_module("openra_env.server.app")
     return _openra_module
+
+
+def _ensure_openra_mounted():
+    global _openra_mounted
+
+    if _openra_mounted:
+        return
+
+    mod = _load_openra_module()
+    if not hasattr(mod, "get_app"):
+        raise RuntimeError("openra_env.server.app has no attribute 'get_app'")
+
+    openra_app = mod.get_app()
+    app.mount(OPENRA_MOUNT_PATH, openra_app)
+    _openra_mounted = True
+
+
+@app.on_event("startup")
+async def _startup_mount_openra():
+    _ensure_openra_mounted()
 
 
 @app.get("/")
@@ -47,7 +74,8 @@ async def openra_status():
         "loaded": _openra_module is not None,
         "mounted": _openra_mounted,
         "module": str(_openra_module) if _openra_module is not None else None,
-        "mount_path": "/openra" if _openra_mounted else None,
+        "mount_path": OPENRA_MOUNT_PATH if _openra_mounted else None,
+        "internal_base_url": os.environ.get("OPENRA_INTERNAL_BASE_URL", ""),
     }
 
 
@@ -62,20 +90,9 @@ async def debug_import():
 
 @app.post("/mount-openra")
 async def mount_openra():
-    global _openra_mounted
-
-    if _openra_mounted:
-        return {"ok": True, "mounted": True, "path": "/openra"}
-
     try:
-        mod = _load_openra_module()
-        if not hasattr(mod, "get_app"):
-            raise RuntimeError("openra_env.server.app has no attribute 'get_app'")
-
-        openra_app = mod.get_app()
-        app.mount("/openra", openra_app)
-        _openra_mounted = True
-        return {"ok": True, "mounted": True, "path": "/openra"}
+        _ensure_openra_mounted()
+        return {"ok": True, "mounted": True, "path": OPENRA_MOUNT_PATH}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

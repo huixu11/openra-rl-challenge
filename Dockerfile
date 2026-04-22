@@ -105,6 +105,8 @@ RUN mkdir -p /root/.config/openra/Content/ra/v2/expand /root/.config/openra/Cont
     ) || echo "WARNING: RA content download failed (replay viewer will be unavailable)"
 
 ENV OPENRA_PATH=/opt/openra
+ENV OPENRA_MOUNT_PATH=/openra
+ENV OPENRA_INTERNAL_BASE_URL=http://localhost:8000/openra
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 ENV DISPLAY=:99

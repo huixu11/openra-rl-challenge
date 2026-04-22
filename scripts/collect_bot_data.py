@@ -644,6 +644,63 @@ def build_artifact_url(env_url: str, route: str, query: dict[str, Any] | None = 
     return f"{base}{route}?{encoded}" if encoded else f"{base}{route}"
 
 
+def _read_json_response(url: str, timeout: float = 10.0) -> dict[str, Any]:
+    with urlrequest.urlopen(url, timeout=timeout) as response:
+        body = response.read().decode("utf-8")
+    return json.loads(body) if body else {}
+
+
+def _post_json_response(url: str, payload: dict[str, Any] | None = None, timeout: float = 30.0) -> dict[str, Any]:
+    data = json.dumps(payload or {}).encode("utf-8")
+    request = urlrequest.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlrequest.urlopen(request, timeout=timeout) as response:
+        body = response.read().decode("utf-8")
+    return json.loads(body) if body else {}
+
+
+def resolve_server_urls(env_url: str) -> dict[str, str]:
+    """Resolve wrapper/root URLs into the actual game and artifact endpoints.
+
+    For the Hugging Face wrapper app:
+      - OpenRA env lives under `/openra`
+      - replay/log artifact helpers live on the wrapper root
+    """
+    base = env_url.rstrip("/")
+
+    if base.endswith("/openra"):
+        artifact_url = base[:-len("/openra")] or base
+        return {
+            "game_url": base,
+            "artifact_url": artifact_url,
+        }
+
+    status_url = build_artifact_url(base, "/openra-status")
+    try:
+        status = _read_json_response(status_url)
+    except Exception:
+        return {
+            "game_url": base,
+            "artifact_url": base,
+        }
+
+    mount_path = str(status.get("mount_path") or "/openra").rstrip("/") or "/openra"
+    if not mount_path.startswith("/"):
+        mount_path = f"/{mount_path}"
+
+    if not status.get("mounted"):
+        _post_json_response(build_artifact_url(base, "/mount-openra"))
+
+    return {
+        "game_url": f"{base}{mount_path}",
+        "artifact_url": base,
+    }
+
+
 def download_remote_replay(
     env_url: str,
     replay_path: str,
@@ -798,7 +855,7 @@ async def wait_for_replay_artifact(
 
 
 async def collect_episode(
-    env_url: str,
+    game_url: str,
     episode_id: int,
     max_steps: int = 20000,
     max_minutes: float = 15.0,
@@ -833,7 +890,7 @@ async def collect_episode(
     result = None
     obs = None
     prev_sig = None
-    async with ToolEnabledOpenRAEnv(base_url=env_url, message_timeout_s=300.0) as env:
+    async with ToolEnabledOpenRAEnv(base_url=game_url, message_timeout_s=300.0) as env:
         if verbose:
             print(f"  Episode {episode_id}: Resetting environment (map={map_name})...")
 
@@ -1066,7 +1123,8 @@ async def collect_episode(
 
 
 async def collect_all(
-    env_url: str,
+    game_url: str,
+    artifact_url: str,
     num_episodes: int,
     max_steps: int,
     max_minutes: float,
@@ -1095,7 +1153,7 @@ async def collect_all(
             t0 = time.time()
             try:
                 episode_data = await collect_episode(
-                    env_url=env_url,
+                    game_url=game_url,
                     episode_id=i,
                     max_steps=max_steps,
                     max_minutes=max_minutes,
@@ -1115,7 +1173,7 @@ async def collect_all(
                 episode_data.get("replay", {}),
                 output_dir,
                 i,
-                env_url=env_url,
+                env_url=artifact_url,
             )
             episode_error = episode_data.get("error", "")
             macro_rows = episode_data.get("macro_rows", [])
@@ -1289,11 +1347,17 @@ def main():
         help="Append new rows to an existing macro dataset instead of overwriting it",
     )
     args = parser.parse_args()
+    server_urls = resolve_server_urls(args.url)
+
+    if server_urls["game_url"] != args.url.rstrip("/"):
+        print(f"Using OpenRA env at {server_urls['game_url']}")
+        print(f"Using artifact helper endpoints at {server_urls['artifact_url']}")
 
     try:
         asyncio.run(
             collect_all(
-                env_url=args.url,
+                game_url=server_urls["game_url"],
+                artifact_url=server_urls["artifact_url"],
                 num_episodes=args.episodes,
                 max_steps=args.max_steps,
                 max_minutes=args.max_minutes,
