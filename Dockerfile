@@ -39,12 +39,13 @@ RUN test -f bin/OpenRA.dll && \
 FROM python:3.11-slim-bookworm AS python-build
 
 ARG OPENRA_RL_REPO=https://github.com/yxc20089/OpenRA-RL.git
-ARG OPENRA_RL_BRANCH=main
+ARG OPENRA_RL_COMMIT=5dadd449c912ac2d4021cc8ed84fc0b385b1543c
 
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth=1 --branch "$OPENRA_RL_BRANCH" "$OPENRA_RL_REPO" /src/openra-rl
+RUN git clone "$OPENRA_RL_REPO" /src/openra-rl && \
+    cd /src/openra-rl && git checkout "$OPENRA_RL_COMMIT"
 WORKDIR /src/openra-rl
 
 RUN pip install --upgrade pip && \
