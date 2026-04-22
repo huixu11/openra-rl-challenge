@@ -1,5 +1,5 @@
 {
-  "space_repo": "huixuv/openra-rl-challenge",
+  "space_repo": "openra-rl/openra-rl-challenge",
   "include": [
     ".gitattributes",
     "Dockerfile",

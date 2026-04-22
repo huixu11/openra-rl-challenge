@@ -72,7 +72,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb libgl1-mesa-dri libgl1-mesa-glx libegl-mesa0 \
     mesa-vulkan-drivers libvulkan1 libsdl2-2.0-0 libopenal1 \
     libfreetype6 liblua5.1-0 libicu72 curl procps \
-    x11vnc novnc websockify \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=python-build /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
@@ -95,9 +94,8 @@ COPY --chown=user:user --from=python-build /src/openra-rl/pyproject.toml /home/u
 COPY --chown=user:user hf_space_server.py /home/user/app/hf_space_server.py
 
 COPY --chown=user:user space-entrypoint.sh /entrypoint.sh
-COPY --from=python-build /src/openra-rl/docker/replay-viewer.sh /replay-viewer.sh
-RUN sed -i 's/\r$//' /entrypoint.sh /replay-viewer.sh && \
-    chmod +x /entrypoint.sh /replay-viewer.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && \
+    chmod +x /entrypoint.sh
 
 RUN install -d -o user -g user \
     "$XDG_CONFIG_HOME/openra/Content/ra/v2/expand" \
@@ -114,7 +112,7 @@ RUN install -d -o user -g user \
     chown -R user:user "$XDG_CONFIG_HOME/openra" && \
     rm -rf /tmp/ra-quickinstall.zip /tmp/ra-content && \
     apt-get purge -y unzip && apt-get autoremove -y && rm -rf /var/lib/apt/lists/* \
-    ) || echo "WARNING: RA content download failed (replay viewer will be unavailable)"
+    ) || echo "WARNING: RA content download failed (matches may fail to start)"
 
 ENV OPENRA_PATH=/opt/openra
 ENV OPENRA_MOUNT_PATH=/openra

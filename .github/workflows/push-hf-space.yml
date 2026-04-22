@@ -34,6 +34,6 @@ jobs:
       - name: Push Space files
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_USERNAME: ${{ vars.HF_USERNAME || 'huixuv' }}
+          HF_USERNAME: openra-rl
         run: |
           python scripts/push_hf_space.py --commit-message "Sync Space files from ${GITHUB_SHA}"
