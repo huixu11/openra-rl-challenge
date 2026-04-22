@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from fastapi import FastAPI
 import uvicorn
 
@@ -12,14 +11,13 @@ async def root():
 async def health():
     return {"status": "healthy"}
 
-def main() -> None:
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        ws_ping_interval=None,
-        ws_ping_timeout=None,
-    )
+@app.get("/test-import")
+async def test_import():
+    from openra_env.server.app import app as openra_app
+    return {"imported": True, "app_type": str(type(openra_app))}
+
+def main():
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
 if __name__ == "__main__":
     main()
