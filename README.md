@@ -6,8 +6,7 @@ Training scripts for [**OpenRA-RL**](https://github.com/yxc20089/OpenRA-RL) - an
 
 Huggingface env
 
-https://huggingface.co/spaces/openra-rl/openra-rl-challenge
-
+https://huggingface.co/spaces/huixuv/openra-rl-challenge
 ## Prerequisites
 
 - Docker (Optional if you want to run OpenRA-RL Env in local)
