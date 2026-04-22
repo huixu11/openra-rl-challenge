@@ -94,7 +94,7 @@ COPY --chown=user:user --from=python-build /src/openra-rl/proto/ /home/user/app/
 COPY --chown=user:user --from=python-build /src/openra-rl/pyproject.toml /home/user/app/
 COPY --chown=user:user hf_space_server.py /home/user/app/hf_space_server.py
 
-COPY --from=python-build /src/openra-rl/docker/entrypoint.sh /entrypoint.sh
+COPY --chown=user:user space-entrypoint.sh /entrypoint.sh
 COPY --from=python-build /src/openra-rl/docker/replay-viewer.sh /replay-viewer.sh
 RUN sed -i 's/\r$//' /entrypoint.sh /replay-viewer.sh && \
     chmod +x /entrypoint.sh /replay-viewer.sh
