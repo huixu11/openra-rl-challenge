@@ -98,10 +98,16 @@ RUN sed -i 's/\r$//' /entrypoint.sh && \
     chmod +x /entrypoint.sh
 
 RUN install -d -o user -g user \
+    "$XDG_CONFIG_HOME" \
+    "$XDG_CONFIG_HOME/openra" \
+    "$XDG_CONFIG_HOME/openra/Content" \
+    "$XDG_CONFIG_HOME/openra/Content/ra" \
+    "$XDG_CONFIG_HOME/openra/Content/ra/v2" \
     "$XDG_CONFIG_HOME/openra/Content/ra/v2/expand" \
     "$XDG_CONFIG_HOME/openra/Content/ra/v2/cnc" \
     "$XDG_CONFIG_HOME/openra/Logs" \
     "$XDG_CONFIG_HOME/openra/Replays" && \
+    chown -R user:user "$XDG_CONFIG_HOME/openra" && \
     ( curl -sfL --max-time 30 -o /tmp/ra-quickinstall.zip \
         https://openra.baxxster.no/openra/ra-quickinstall.zip && \
     apt-get update && apt-get install -y --no-install-recommends unzip && \

@@ -17,6 +17,17 @@ https://huggingface.co/spaces/openra-rl/openra-rl-challenge
 ### huggingface env
 https://huggingface.co/spaces/openra-rl/openra-rl-challenge
 
+```powershell
+ PowerShell:
+
+  curl.exe -X POST "https://openra-rl-openra-rl-challenge.hf.space/mount-openra"
+  curl.exe "https://openra-rl-openra-rl-challenge.hf.space/openra-status"
+
+  # If mount-openra returns 500, then hit:
+
+  curl.exe -X POST "https://openra-rl-openra-rl-challenge.hf.space/debug-import"
+```
+
 ```bash
 python scripts/collect_bot_data.py --url https://openra-rl-openra-rl-challenge.hf.space --episodes 1  --max-minutes 10 --bot normal --verbose
 ```
