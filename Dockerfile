@@ -59,6 +59,12 @@ FROM python:3.11-slim-bookworm
 LABEL maintainer="OpenRA-RL"
 LABEL description="OpenRA RL Environment with AI opponent fix"
 
+RUN useradd -m -u 1000 user
+ENV HOME=/home/user \
+    PATH=/home/user/.local/bin:$PATH \
+    XDG_CONFIG_HOME=/home/user/.config
+WORKDIR $HOME/app
+
 COPY --from=dotnet-runtime /usr/share/dotnet /usr/share/dotnet
 RUN ln -s /usr/share/dotnet/dotnet /usr/bin/dotnet
 
@@ -83,24 +89,29 @@ RUN LIBDIR=$( [ "$(dpkg --print-architecture)" = "arm64" ] && echo "/usr/lib/aar
     ln -sf "$LIBDIR/libfreetype.so.6" /opt/openra/bin/freetype6.so && \
     ln -sf "$LIBDIR/liblua5.1.so.0" /opt/openra/bin/lua51.so
 
-COPY --from=python-build /src/openra-rl/openra_env/ /app/openra_env/
-COPY --from=python-build /src/openra-rl/proto/ /app/proto/
-COPY --from=python-build /src/openra-rl/pyproject.toml /app/
-COPY hf_space_server.py /app/hf_space_server.py
+COPY --chown=user:user --from=python-build /src/openra-rl/openra_env/ /home/user/app/openra_env/
+COPY --chown=user:user --from=python-build /src/openra-rl/proto/ /home/user/app/proto/
+COPY --chown=user:user --from=python-build /src/openra-rl/pyproject.toml /home/user/app/
+COPY --chown=user:user hf_space_server.py /home/user/app/hf_space_server.py
 
 COPY --from=python-build /src/openra-rl/docker/entrypoint.sh /entrypoint.sh
 COPY --from=python-build /src/openra-rl/docker/replay-viewer.sh /replay-viewer.sh
 RUN sed -i 's/\r$//' /entrypoint.sh /replay-viewer.sh && \
     chmod +x /entrypoint.sh /replay-viewer.sh
 
-RUN mkdir -p /root/.config/openra/Content/ra/v2/expand /root/.config/openra/Content/ra/v2/cnc && \
+RUN install -d -o user -g user \
+    "$XDG_CONFIG_HOME/openra/Content/ra/v2/expand" \
+    "$XDG_CONFIG_HOME/openra/Content/ra/v2/cnc" \
+    "$XDG_CONFIG_HOME/openra/Logs" \
+    "$XDG_CONFIG_HOME/openra/Replays" && \
     ( curl -sfL --max-time 30 -o /tmp/ra-quickinstall.zip \
         https://openra.baxxster.no/openra/ra-quickinstall.zip && \
     apt-get update && apt-get install -y --no-install-recommends unzip && \
     unzip -o /tmp/ra-quickinstall.zip -d /tmp/ra-content && \
-    cp /tmp/ra-content/*.mix /root/.config/openra/Content/ra/v2/ && \
-    cp /tmp/ra-content/expand/* /root/.config/openra/Content/ra/v2/expand/ && \
-    cp /tmp/ra-content/cnc/* /root/.config/openra/Content/ra/v2/cnc/ && \
+    cp /tmp/ra-content/*.mix "$XDG_CONFIG_HOME/openra/Content/ra/v2/" && \
+    cp /tmp/ra-content/expand/* "$XDG_CONFIG_HOME/openra/Content/ra/v2/expand/" && \
+    cp /tmp/ra-content/cnc/* "$XDG_CONFIG_HOME/openra/Content/ra/v2/cnc/" && \
+    chown -R user:user "$XDG_CONFIG_HOME/openra" && \
     rm -rf /tmp/ra-quickinstall.zip /tmp/ra-content && \
     apt-get purge -y unzip && apt-get autoremove -y && rm -rf /var/lib/apt/lists/* \
     ) || echo "WARNING: RA content download failed (replay viewer will be unavailable)"
@@ -108,7 +119,7 @@ RUN mkdir -p /root/.config/openra/Content/ra/v2/expand /root/.config/openra/Cont
 ENV OPENRA_PATH=/opt/openra
 ENV OPENRA_MOUNT_PATH=/openra
 ENV OPENRA_INTERNAL_BASE_URL=http://localhost:8000/openra
-ENV PYTHONPATH=/app
+ENV PYTHONPATH=/home/user/app
 ENV PYTHONUNBUFFERED=1
 ENV DISPLAY=:99
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
@@ -120,6 +131,8 @@ ENV BOT_TYPE=easy
 ENV RECORD_REPLAYS=true
 
 EXPOSE 8000
+
+USER user
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
