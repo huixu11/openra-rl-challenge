@@ -15,7 +15,15 @@ from openra_env.server.app import app
 
 OPENRA_MOD = os.environ.get("OPENRA_MOD", "ra")
 
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "openra-rl-space"}
 
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+    
 def _is_relative_to(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
